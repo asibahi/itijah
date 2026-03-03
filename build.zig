@@ -4,6 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const test_filter = b.option([]const u8, "test_filter", "Run only tests whose names contain this substring");
+    const shared_uucode = b.option(bool, "shared_uucode", "Expect caller to inject a prebuilt 'uucode' module into itijah") orelse false;
 
     const fields: []const []const u8 = &.{
         "bidi_class",
@@ -22,10 +23,22 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    mod.addImport("uucode", uucode);
+    if (!shared_uucode) {
+        mod.addImport("uucode", uucode);
+    }
+
+    const internal_mod = if (shared_uucode) blk: {
+        const m = b.createModule(.{
+            .root_source_file = b.path("src/lib.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        m.addImport("uucode", uucode);
+        break :blk m;
+    } else mod;
 
     const tests = b.addTest(.{
-        .root_module = mod,
+        .root_module = internal_mod,
         .filters = if (test_filter) |filter| &.{filter} else &.{},
     });
     if (b.lazyDependency("ucd", .{})) |ucd| {
@@ -47,7 +60,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseFast,
             .link_libc = true,
         });
-        diff_mod.addImport("itijah", mod);
+        diff_mod.addImport("itijah", internal_mod);
 
         const diff_exe = b.addExecutable(.{
             .name = "itijah-test-diff",
@@ -67,7 +80,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseFast,
             .link_libc = true,
         });
-        bench_mod.addImport("itijah", mod);
+        bench_mod.addImport("itijah", internal_mod);
 
         const bench_exe = b.addExecutable(.{
             .name = "itijah-bench",
@@ -84,7 +97,7 @@ pub fn build(b: *std.Build) void {
                 .optimize = .ReleaseFast,
                 .link_libc = true,
             });
-            compare_mod.addImport("itijah", mod);
+            compare_mod.addImport("itijah", internal_mod);
 
             const compare_exe = b.addExecutable(.{
                 .name = "itijah-compare",
@@ -103,7 +116,7 @@ pub fn build(b: *std.Build) void {
 
     const docs_obj = b.addObject(.{
         .name = "itijah-docs",
-        .root_module = mod,
+        .root_module = internal_mod,
     });
     const docs = docs_obj.getEmittedDocs();
     const install_docs = b.addInstallDirectory(.{

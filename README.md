@@ -143,6 +143,22 @@ Requires Zig 0.15.2+.
   - system FriBidi headers + library
   - ICU runtime library (`icuuc`) available on host (loaded dynamically)
 
+### Shared `uucode` integration
+
+If a host app already creates a `uucode` module (for example to avoid duplicate module instances in a mono-build), depend on `itijah` with:
+
+```zig
+const itijah_dep = b.dependency("itijah", .{
+    .target = target,
+    .optimize = optimize,
+    .shared_uucode = true,
+});
+const itijah_mod = itijah_dep.module("itijah");
+itijah_mod.addImport("uucode", shared_uucode_mod);
+```
+
+When `shared_uucode = true`, `itijah` exports the library module without creating its own `uucode` import, so the caller can inject a shared one.
+
 ### `bench-compare` setup
 
 macOS (Homebrew):
