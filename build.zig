@@ -18,6 +18,12 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .fields = fields,
         }).module("uucode")
+    else if (b.lazyDependency("uucode", .{
+        .target = target,
+        .optimize = optimize,
+        .fields = fields,
+    })) |dep|
+        dep.module("uucode")
     else
         null;
 
@@ -28,23 +34,7 @@ pub fn build(b: *std.Build) void {
     });
     if (uucode) |u| mod.addImport("uucode", u);
 
-    const internal_mod = if (shared_uucode) blk: {
-        const test_uucode = if (b.lazyDependency("uucode", .{
-            .target = target,
-            .optimize = optimize,
-            .fields = fields,
-        })) |dep|
-            dep.module("uucode")
-        else
-            break :blk mod;
-        const m = b.createModule(.{
-            .root_source_file = b.path("src/lib.zig"),
-            .target = target,
-            .optimize = optimize,
-        });
-        m.addImport("uucode", test_uucode);
-        break :blk m;
-    } else mod;
+    const internal_mod = mod;
 
     const tests = b.addTest(.{
         .root_module = internal_mod,
