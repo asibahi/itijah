@@ -12,28 +12,37 @@ pub fn build(b: *std.Build) void {
         "joining_type",
         "is_bidi_mirrored",
     };
-    const uucode = b.dependency("uucode", .{
-        .target = target,
-        .optimize = optimize,
-        .fields = fields,
-    }).module("uucode");
+    const uucode = if (!shared_uucode)
+        b.dependency("uucode", .{
+            .target = target,
+            .optimize = optimize,
+            .fields = fields,
+        }).module("uucode")
+    else
+        null;
 
     const mod = b.addModule("itijah", .{
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = optimize,
     });
-    if (!shared_uucode) {
-        mod.addImport("uucode", uucode);
-    }
+    if (uucode) |u| mod.addImport("uucode", u);
 
     const internal_mod = if (shared_uucode) blk: {
+        const test_uucode = if (b.lazyDependency("uucode", .{
+            .target = target,
+            .optimize = optimize,
+            .fields = fields,
+        })) |dep|
+            dep.module("uucode")
+        else
+            break :blk mod;
         const m = b.createModule(.{
             .root_source_file = b.path("src/lib.zig"),
             .target = target,
             .optimize = optimize,
         });
-        m.addImport("uucode", uucode);
+        m.addImport("uucode", test_uucode);
         break :blk m;
     } else mod;
 

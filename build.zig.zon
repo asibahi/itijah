@@ -1,6 +1,6 @@
 .{
     .name = .itijah,
-    .version = "0.1.1",
+    .version = "0.1.2",
     .dependencies = .{
         .ucd = .{
             .url = "https://www.unicode.org/Public/zipped/16.0.0/UCD.zip",
