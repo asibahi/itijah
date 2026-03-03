@@ -1,0 +1,38 @@
+name: Full Conformance
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 2 * * *"
+
+concurrency:
+  group: full-conformance-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  full:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfribidi-dev libicu-dev
+
+      - name: Full conformance
+        run: ITIJAH_CONFORMANCE_MODE=full zig build test -Doptimize=ReleaseFast
+
+      - name: Differential strict ICU gate
+        run: ITIJAH_DIFF_REQUIRE_ICU=1 ITIJAH_DIFF_CASES_PER_PROFILE=6 zig build test-diff
+
+      - name: FriBidi parity guardrail (nightly/manual)
+        run: ITIJAH_COMPARE_ONLY_PARITY=1 zig build bench-compare

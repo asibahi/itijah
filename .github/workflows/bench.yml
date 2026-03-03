@@ -1,0 +1,45 @@
+name: Bench
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfribidi-dev libicu-dev
+
+      - name: Run bench
+        run: zig build bench | tee bench.txt
+
+      - name: Run compare bench
+        run: zig build bench-compare | tee bench-compare.txt
+
+      - name: Run compare bench (reuse mode)
+        run: ITIJAH_COMPARE_ITIJAH_REUSE=1 zig build bench-compare | tee bench-compare-reuse.txt
+
+      - name: Upload benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: itijah-bench-${{ github.sha }}
+          path: |
+            bench.txt
+            bench-compare.txt
+            bench-compare-reuse.txt

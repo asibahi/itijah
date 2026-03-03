@@ -1,0 +1,25 @@
+.{
+    .name = .itijah,
+    .version = "0.1.0",
+    .dependencies = .{
+        .ucd = .{
+            .url = "https://www.unicode.org/Public/zipped/16.0.0/UCD.zip",
+            .hash = "N-V-__8AALTJcQJ3hosujokSgxYTsa3q1mDZ2dasYhuJwaOV",
+            .lazy = true,
+        },
+        .uucode = .{
+            .url = "https://github.com/jacobsandlund/uucode/archive/refs/tags/v0.2.0.tar.gz",
+            .hash = "uucode-0.2.0-ZZjBPqZVVABQepOqZHR7vV_NcaN-wats0IB6o-Exj6m9",
+        },
+    },
+    .fingerprint = 0xae8afccd6159e191,
+    .minimum_zig_version = "0.15.2",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "docs",
+        "LICENSE",
+        "README.md",
+    },
+}
