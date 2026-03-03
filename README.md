@@ -158,6 +158,7 @@ itijah_mod.addImport("uucode", shared_uucode_mod);
 ```
 
 When `shared_uucode = true`, `itijah` exports the library module without creating its own `uucode` import, so the caller can inject a shared one.
+For standalone development in this repository, run build/test commands without that flag.
 
 ### `bench-compare` setup
 

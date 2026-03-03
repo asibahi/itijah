@@ -18,12 +18,6 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .fields = fields,
         }).module("uucode")
-    else if (b.lazyDependency("uucode", .{
-        .target = target,
-        .optimize = optimize,
-        .fields = fields,
-    })) |dep|
-        dep.module("uucode")
     else
         null;
 
