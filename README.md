@@ -79,6 +79,10 @@ defer vis.deinit();
 const l2v = try itijah.logToVis(allocator, emb.levels, dir.toLevel());
 defer allocator.free(l2v);
 
+// Visual runs in visual order (contiguous logical slices + direction)
+const runs = try itijah.getVisualRuns(allocator, emb.levels, dir.toLevel());
+defer allocator.free(runs);
+
 // Remove bidi control marks
 const cleaned = try itijah.removeBidiMarks(allocator, codepoints, null);
 defer allocator.free(cleaned.result);

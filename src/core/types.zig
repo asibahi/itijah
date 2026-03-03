@@ -59,6 +59,17 @@ pub const ReorderResult = struct {
     }
 };
 
+pub const VisualRun = struct {
+    // Start index in visual order for this run.
+    visual_start: u32,
+    // Start index in logical order for a contiguous logical slice.
+    logical_start: u32,
+    // Number of codepoints in this run.
+    len: u32,
+    // Run direction for shaping/layout.
+    is_rtl: bool,
+};
+
 pub const RemoveBidiMarksResult = struct {
     result: []u21,
     new_len: u32,

@@ -24,6 +24,7 @@ pub const BidiLevel = level.BidiLevel;
 pub const ParDirection = types.ParDirection;
 pub const EmbeddingResult = types.EmbeddingResult;
 pub const ReorderResult = types.ReorderResult;
+pub const VisualRun = types.VisualRun;
 pub const EmbeddingScratch = embedding.EmbeddingScratch;
 pub const ReorderScratch = reorder.ReorderScratch;
 pub const ReorderFlags = types.ReorderFlags;
@@ -94,6 +95,15 @@ pub fn logToVis(
     base_level: BidiLevel,
 ) ![]u32 {
     return reorder.logToVisMap(allocator, levels, base_level);
+}
+
+/// Derive visual runs in visual order from embedding levels.
+pub fn getVisualRuns(
+    allocator: Allocator,
+    levels: []const BidiLevel,
+    base_level: BidiLevel,
+) ![]VisualRun {
+    return reorder.visualRuns(allocator, levels, base_level);
 }
 
 /// Remove bidi control marks (LRM, RLM, ALM, LRE, RLE, PDF, LRO, RLO, LRI, RLI, FSI, PDI)

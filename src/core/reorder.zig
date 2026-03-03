@@ -230,6 +230,65 @@ pub fn logToVisMap(
     return l_to_v;
 }
 
+/// Derive visual runs in visual order from embedding levels.
+///
+/// Each run maps to a contiguous logical slice `[logical_start .. logical_start + len)`.
+/// The returned runs are ordered by visual position and carry `is_rtl` for shaping/layout.
+pub fn visualRuns(
+    allocator: Allocator,
+    levels: []const BidiLevel,
+    base_level: BidiLevel,
+) ![]types.VisualRun {
+    const len: u32 = @intCast(levels.len);
+    if (len == 0) return try allocator.alloc(types.VisualRun, 0);
+
+    const v_to_l = try allocator.alloc(u32, len);
+    defer allocator.free(v_to_l);
+    initIdentityMap(v_to_l);
+
+    var max_level: BidiLevel = base_level;
+    var min_odd: BidiLevel = level_mod.max_resolved_level + 1;
+    for (levels) |l| {
+        if (l > max_level) max_level = l;
+        if (level_mod.isRtl(l) and l < min_odd) min_odd = l;
+    }
+    applyL2(v_to_l, levels, len, min_odd, max_level);
+
+    var runs = std.ArrayListUnmanaged(types.VisualRun){};
+    errdefer runs.deinit(allocator);
+    try runs.ensureTotalCapacity(allocator, len);
+
+    var visual_idx: u32 = 0;
+    while (visual_idx < len) {
+        const visual_start = visual_idx;
+        const first_logical = v_to_l[visual_idx];
+        const rtl = level_mod.isRtl(levels[first_logical]);
+        const step: i64 = if (rtl) -1 else 1;
+        var prev_logical: i64 = @intCast(first_logical);
+
+        visual_idx += 1;
+        while (visual_idx < len) : (visual_idx += 1) {
+            const logical = v_to_l[visual_idx];
+            if (level_mod.isRtl(levels[logical]) != rtl) break;
+
+            const logical_i64: i64 = @intCast(logical);
+            if (logical_i64 != prev_logical + step) break;
+            prev_logical = logical_i64;
+        }
+
+        const run_len = visual_idx - visual_start;
+        const logical_start = if (rtl) v_to_l[visual_idx - 1] else first_logical;
+        try runs.append(allocator, .{
+            .visual_start = visual_start,
+            .logical_start = logical_start,
+            .len = run_len,
+            .is_rtl = rtl,
+        });
+    }
+
+    return try runs.toOwnedSlice(allocator);
+}
+
 /// Remove bidi control marks from a codepoint array.
 ///
 /// If `levels` is provided, this function compacts it in-place so `levels[0..new_len]`
@@ -407,6 +466,82 @@ test "reorder visual only scratch reuse" {
     const vis2 = try reorderVisualOnlyScratch(gpa, &scratch, &cps2, &lv2, 0);
     defer gpa.free(vis2);
     try testing.expectEqualSlices(u21, &cps2, vis2);
+}
+
+test "visual runs pure LTR" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    const levels = [_]BidiLevel{ 0, 0, 0, 0 };
+    const runs = try visualRuns(gpa, &levels, 0);
+    defer gpa.free(runs);
+
+    try testing.expectEqual(@as(usize, 1), runs.len);
+    try testing.expectEqual(@as(u32, 0), runs[0].visual_start);
+    try testing.expectEqual(@as(u32, 0), runs[0].logical_start);
+    try testing.expectEqual(@as(u32, 4), runs[0].len);
+    try testing.expect(!runs[0].is_rtl);
+}
+
+test "visual runs split embedded LTR digits inside RTL" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    // RTL letters, then LTR digits (level 2), then RTL letters.
+    const levels = [_]BidiLevel{ 1, 1, 2, 2, 1, 1 };
+    const runs = try visualRuns(gpa, &levels, 1);
+    defer gpa.free(runs);
+
+    try testing.expectEqual(@as(usize, 3), runs.len);
+
+    try testing.expectEqual(@as(u32, 0), runs[0].visual_start);
+    try testing.expectEqual(@as(u32, 4), runs[0].logical_start);
+    try testing.expectEqual(@as(u32, 2), runs[0].len);
+    try testing.expect(runs[0].is_rtl);
+
+    try testing.expectEqual(@as(u32, 2), runs[1].visual_start);
+    try testing.expectEqual(@as(u32, 2), runs[1].logical_start);
+    try testing.expectEqual(@as(u32, 2), runs[1].len);
+    try testing.expect(!runs[1].is_rtl);
+
+    try testing.expectEqual(@as(u32, 4), runs[2].visual_start);
+    try testing.expectEqual(@as(u32, 0), runs[2].logical_start);
+    try testing.expectEqual(@as(u32, 2), runs[2].len);
+    try testing.expect(runs[2].is_rtl);
+}
+
+test "visual runs reconstruct reorder v_to_l map" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    const cps = [_]u21{ 'a', 'b', 0x05D0, 0x05D1, '5', '4', 'c', 0x05D2 };
+    const levels = [_]BidiLevel{ 0, 0, 1, 1, 2, 2, 0, 1 };
+
+    var reordered = try reorderLine(gpa, &cps, &levels, 0);
+    defer reordered.deinit();
+
+    const runs = try visualRuns(gpa, &levels, 0);
+    defer gpa.free(runs);
+
+    var rebuilt = std.ArrayListUnmanaged(u32){};
+    defer rebuilt.deinit(gpa);
+    try rebuilt.ensureTotalCapacity(gpa, reordered.v_to_l.len);
+
+    for (runs) |run| {
+        if (run.is_rtl) {
+            var i = run.len;
+            while (i > 0) {
+                i -= 1;
+                try rebuilt.append(gpa, run.logical_start + i);
+            }
+        } else {
+            for (0..run.len) |i| {
+                try rebuilt.append(gpa, run.logical_start + @as(u32, @intCast(i)));
+            }
+        }
+    }
+
+    try testing.expectEqualSlices(u32, reordered.v_to_l, rebuilt.items);
 }
 
 test "remove bidi marks" {
