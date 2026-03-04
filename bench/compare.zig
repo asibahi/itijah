@@ -14,6 +14,8 @@ const Allocator = std.mem.Allocator;
 const Op = enum {
     analysis,
     reorder_line,
+    resolve_visual_layout,
+    resolve_visual_layout_scratch,
 };
 
 const Impl = enum {
@@ -159,10 +161,12 @@ const MeasuringAllocator = struct {
 const ItijahScratchContext = struct {
     embedding: itijah.EmbeddingScratch = .{},
     reorder: itijah.ReorderScratch = .{},
+    layout: itijah.VisualLayoutScratch = .{},
 
     fn deinit(self: *ItijahScratchContext, allocator: Allocator) void {
         self.embedding.deinit(allocator);
         self.reorder.deinit(allocator);
+        self.layout.deinit(allocator);
     }
 };
 
@@ -512,9 +516,16 @@ fn runItijah(allocator: Allocator, op: Op, cps: []const u21) !void {
     var emb = try itijah.getParEmbeddingLevels(allocator, cps, &dir);
     defer emb.deinit();
 
-    if (op == .reorder_line) {
-        const visual = try itijah.reorderVisualOnly(allocator, cps, emb.levels, dir.toLevel());
-        allocator.free(visual);
+    switch (op) {
+        .analysis => {},
+        .reorder_line => {
+            const visual = try itijah.reorderVisualOnly(allocator, cps, emb.levels, dir.toLevel());
+            allocator.free(visual);
+        },
+        .resolve_visual_layout, .resolve_visual_layout_scratch => {
+            var layout = try itijah.resolveVisualLayout(allocator, cps, .{ .base_dir = .ltr });
+            layout.deinit();
+        },
     }
 }
 
@@ -524,13 +535,24 @@ fn runItijahScratch(
     op: Op,
     cps: []const u21,
 ) !void {
-    var dir: itijah.ParDirection = .auto_ltr;
-    var emb = try itijah.getParEmbeddingLevelsScratch(allocator, &ctx.embedding, cps, &dir);
-    defer emb.deinit();
+    switch (op) {
+        .analysis, .reorder_line => {
+            var dir: itijah.ParDirection = .auto_ltr;
+            var emb = try itijah.getParEmbeddingLevelsScratch(allocator, &ctx.embedding, cps, &dir);
+            defer emb.deinit();
 
-    if (op == .reorder_line) {
-        const visual = try itijah.reorderVisualOnlyScratch(allocator, &ctx.reorder, cps, emb.levels, dir.toLevel());
-        allocator.free(visual);
+            if (op == .reorder_line) {
+                const visual = try itijah.reorderVisualOnlyScratch(allocator, &ctx.reorder, cps, emb.levels, dir.toLevel());
+                allocator.free(visual);
+            }
+        },
+        .resolve_visual_layout => {
+            var layout = try itijah.resolveVisualLayout(allocator, cps, .{ .base_dir = .ltr });
+            layout.deinit();
+        },
+        .resolve_visual_layout_scratch => {
+            _ = try itijah.resolveVisualLayoutScratch(allocator, &ctx.layout, cps, .{ .base_dir = .ltr });
+        },
     }
 }
 
@@ -654,17 +676,16 @@ fn computeFribidi(cps: []const u21) !FribidiResult {
 fn fribidiParityCase(allocator: Allocator, case: Case) !?Mismatch {
     const fri = try computeFribidi(case.cps);
 
-    var dir: itijah.ParDirection = .auto_ltr;
-    var emb = try itijah.getParEmbeddingLevels(allocator, case.cps, &dir);
-    defer emb.deinit();
+    var layout = try itijah.resolveVisualLayout(allocator, case.cps, .{ .base_dir = .auto_ltr });
+    defer layout.deinit();
 
-    if (emb.levels.len != fri.len) return .{
+    if (layout.levels.len != fri.len) return .{
         .kind = .levels,
         .index = 0,
         .expected = @intCast(fri.len),
-        .actual = @intCast(emb.levels.len),
+        .actual = @intCast(layout.levels.len),
     };
-    for (emb.levels, 0..) |lvl, i| {
+    for (layout.levels, 0..) |lvl, i| {
         const expected: u32 = @intCast(fri.levels[i]);
         const actual: u32 = lvl;
         if (actual != expected) {
@@ -677,15 +698,13 @@ fn fribidiParityCase(allocator: Allocator, case: Case) !?Mismatch {
         }
     }
 
-    var vis = try itijah.reorderLine(allocator, case.cps, emb.levels, dir.toLevel());
-    defer vis.deinit();
-    if (vis.v_to_l.len != fri.len) return .{
+    if (layout.v_to_l.len != fri.len) return .{
         .kind = .v_to_l,
         .index = 0,
         .expected = @intCast(fri.len),
-        .actual = @intCast(vis.v_to_l.len),
+        .actual = @intCast(layout.v_to_l.len),
     };
-    for (vis.v_to_l, 0..) |idx, i| {
+    for (layout.v_to_l, 0..) |idx, i| {
         const expected = fri.v_to_l[i];
         const actual = idx;
         if (actual != expected) {
@@ -694,6 +713,34 @@ fn fribidiParityCase(allocator: Allocator, case: Case) !?Mismatch {
                 .index = i,
                 .expected = expected,
                 .actual = actual,
+            };
+        }
+    }
+
+    // Terminal-focused parity: run-derived mapping must reconstruct v_to_l.
+    var rebuilt = std.ArrayListUnmanaged(u32){};
+    defer rebuilt.deinit(allocator);
+    try rebuilt.ensureTotalCapacity(allocator, layout.v_to_l.len);
+    for (layout.runs) |run| {
+        if (run.is_rtl) {
+            var i = run.len;
+            while (i > 0) {
+                i -= 1;
+                try rebuilt.append(allocator, run.logical_start + i);
+            }
+        } else {
+            for (0..run.len) |i| {
+                try rebuilt.append(allocator, run.logical_start + @as(u32, @intCast(i)));
+            }
+        }
+    }
+    for (rebuilt.items, 0..) |logical_idx, i| {
+        if (logical_idx != layout.v_to_l[i]) {
+            return .{
+                .kind = .v_to_l,
+                .index = i,
+                .expected = layout.v_to_l[i],
+                .actual = logical_idx,
             };
         }
     }
@@ -938,6 +985,10 @@ fn runBenchCase(
     try bench(writer, case, .itijah, .reorder_line, utf16, icu, itijah_reuse);
     try bench(writer, case, .fribidi, .reorder_line, utf16, icu, itijah_reuse);
     try bench(writer, case, .icu, .reorder_line, utf16, icu, itijah_reuse);
+
+    // Terminal-focused API paths.
+    try bench(writer, case, .itijah, .resolve_visual_layout, utf16, icu, false);
+    try bench(writer, case, .itijah, .resolve_visual_layout_scratch, utf16, icu, true);
 }
 
 pub fn main() !void {

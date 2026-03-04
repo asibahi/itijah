@@ -22,6 +22,43 @@ pub const ReorderScratch = struct {
     }
 };
 
+pub const ReorderLineScratch = struct {
+    visual: std.ArrayListUnmanaged(u21) = .{},
+    l_to_v: std.ArrayListUnmanaged(u32) = .{},
+    v_to_l: std.ArrayListUnmanaged(u32) = .{},
+
+    pub fn deinit(self: *ReorderLineScratch, allocator: Allocator) void {
+        self.visual.deinit(allocator);
+        self.l_to_v.deinit(allocator);
+        self.v_to_l.deinit(allocator);
+    }
+};
+
+pub const VisualRunsScratch = struct {
+    v_to_l: std.ArrayListUnmanaged(u32) = .{},
+    runs: std.ArrayListUnmanaged(types.VisualRun) = .{},
+
+    pub fn deinit(self: *VisualRunsScratch, allocator: Allocator) void {
+        self.v_to_l.deinit(allocator);
+        self.runs.deinit(allocator);
+    }
+};
+
+pub const LogToVisScratch = struct {
+    v_to_l: std.ArrayListUnmanaged(u32) = .{},
+    l_to_v: std.ArrayListUnmanaged(u32) = .{},
+
+    pub fn deinit(self: *LogToVisScratch, allocator: Allocator) void {
+        self.v_to_l.deinit(allocator);
+        self.l_to_v.deinit(allocator);
+    }
+};
+
+const LevelExtents = struct {
+    max_level: BidiLevel,
+    min_odd: BidiLevel,
+};
+
 /// Reorder a line of codepoints from logical to visual order.
 /// Implements Rules L1 (part 4), L2. L3/L4 are Phase 2.
 pub fn reorderLine(
@@ -53,16 +90,10 @@ pub fn reorderLine(
     errdefer allocator.free(map);
     initIdentityMap(map);
 
-    // Find max level
-    var max_level: BidiLevel = base_level;
-    var min_odd_level: BidiLevel = level_mod.max_resolved_level + 1;
-    for (levels) |l| {
-        if (l > max_level) max_level = l;
-        if (level_mod.isRtl(l) and l < min_odd_level) min_odd_level = l;
-    }
+    const extents = levelExtents(levels, base_level);
 
     // L2: Reverse subsequences at each level from max down to min odd
-    applyL2(map, levels, len, min_odd_level, max_level);
+    applyL2(map, levels, len, extents.min_odd, extents.max_level);
 
     // Build visual string
     const visual = try allocator.alloc(u21, len);
@@ -74,16 +105,58 @@ pub fn reorderLine(
     // Build reverse map (v_to_l is already `map`, build l_to_v)
     const l_to_v = try allocator.alloc(u32, len);
     errdefer allocator.free(l_to_v);
-    for (map, 0..) |logical_idx, visual_idx| {
-        l_to_v[logical_idx] = @intCast(visual_idx);
-    }
+    fillLToVFromVToL(l_to_v, map);
 
     return .{
         .visual = visual,
         .l_to_v = l_to_v,
         .v_to_l = map,
-        .max_level = max_level,
+        .max_level = extents.max_level,
         .allocator = allocator,
+    };
+}
+
+/// Reorder a line using reusable scratch buffers.
+///
+/// Returned slices are owned by `scratch` and remain valid until the next call that
+/// mutates the same scratch object.
+pub fn reorderLineScratch(
+    allocator: Allocator,
+    scratch: *ReorderLineScratch,
+    codepoints: []const u21,
+    levels: []const BidiLevel,
+    base_level: BidiLevel,
+) !types.ReorderResultScratchView {
+    const len: u32 = @intCast(codepoints.len);
+    std.debug.assert(codepoints.len == levels.len);
+
+    try scratch.visual.ensureTotalCapacity(allocator, len);
+    scratch.visual.items.len = len;
+    try scratch.l_to_v.ensureTotalCapacity(allocator, len);
+    scratch.l_to_v.items.len = len;
+    try scratch.v_to_l.ensureTotalCapacity(allocator, len);
+    scratch.v_to_l.items.len = len;
+
+    const visual = scratch.visual.items;
+    const l_to_v = scratch.l_to_v.items;
+    const v_to_l = scratch.v_to_l.items;
+
+    const extents = levelExtents(levels, base_level);
+    if (len > 0) {
+        initIdentityMap(v_to_l);
+        applyL2(v_to_l, levels, len, extents.min_odd, extents.max_level);
+
+        for (0..len) |i| {
+            visual[i] = codepoints[v_to_l[i]];
+        }
+        fillLToVFromVToL(l_to_v, v_to_l);
+    }
+
+    return .{
+        .visual = visual,
+        .l_to_v = l_to_v,
+        .v_to_l = v_to_l,
+        .max_level = extents.max_level,
     };
 }
 
@@ -102,21 +175,16 @@ pub fn reorderVisualOnly(
     errdefer allocator.free(visual);
     if (len == 0) return visual;
 
-    var max_level: BidiLevel = base_level;
-    var min_odd_level: BidiLevel = level_mod.max_resolved_level + 1;
-    for (levels) |l| {
-        if (l > max_level) max_level = l;
-        if (level_mod.isRtl(l) and l < min_odd_level) min_odd_level = l;
-    }
+    const extents = levelExtents(levels, base_level);
 
-    if (min_odd_level > max_level) {
+    if (extents.min_odd > extents.max_level) {
         @memcpy(visual, codepoints);
         return visual;
     }
 
     if (len <= visual_inplace_threshold) {
         @memcpy(visual, codepoints);
-        applyL2Visual(visual, levels, len, min_odd_level, max_level);
+        applyL2Visual(visual, levels, len, extents.min_odd, extents.max_level);
         return visual;
     }
 
@@ -124,7 +192,7 @@ pub fn reorderVisualOnly(
         const map = try allocator.alloc(u16, len);
         defer allocator.free(map);
         initIdentityMap(map);
-        applyL2(map, levels, len, min_odd_level, max_level);
+        applyL2(map, levels, len, extents.min_odd, extents.max_level);
         for (0..len) |i| {
             visual[i] = codepoints[map[i]];
         }
@@ -132,7 +200,7 @@ pub fn reorderVisualOnly(
         const map = try allocator.alloc(u32, len);
         defer allocator.free(map);
         initIdentityMap(map);
-        applyL2(map, levels, len, min_odd_level, max_level);
+        applyL2(map, levels, len, extents.min_odd, extents.max_level);
         for (0..len) |i| {
             visual[i] = codepoints[map[i]];
         }
@@ -156,14 +224,9 @@ pub fn reorderVisualOnlyScratch(
     errdefer allocator.free(visual);
     if (len == 0) return visual;
 
-    var max_level: BidiLevel = base_level;
-    var min_odd_level: BidiLevel = level_mod.max_resolved_level + 1;
-    for (levels) |l| {
-        if (l > max_level) max_level = l;
-        if (level_mod.isRtl(l) and l < min_odd_level) min_odd_level = l;
-    }
+    const extents = levelExtents(levels, base_level);
 
-    if (min_odd_level > max_level) {
+    if (extents.min_odd > extents.max_level) {
         @memcpy(visual, codepoints);
         return visual;
     }
@@ -172,7 +235,7 @@ pub fn reorderVisualOnlyScratch(
     // For very large lines, map+gather is typically faster despite higher memory writes.
     if (len <= visual_inplace_threshold) {
         @memcpy(visual, codepoints);
-        applyL2Visual(visual, levels, len, min_odd_level, max_level);
+        applyL2Visual(visual, levels, len, extents.min_odd, extents.max_level);
         return visual;
     }
 
@@ -181,7 +244,7 @@ pub fn reorderVisualOnlyScratch(
         scratch.map16.items.len = len;
         const map = scratch.map16.items;
         initIdentityMap(map);
-        applyL2(map, levels, len, min_odd_level, max_level);
+        applyL2(map, levels, len, extents.min_odd, extents.max_level);
         for (0..len) |i| {
             visual[i] = codepoints[map[i]];
         }
@@ -190,7 +253,7 @@ pub fn reorderVisualOnlyScratch(
         scratch.map32.items.len = len;
         const map = scratch.map32.items;
         initIdentityMap(map);
-        applyL2(map, levels, len, min_odd_level, max_level);
+        applyL2(map, levels, len, extents.min_odd, extents.max_level);
         for (0..len) |i| {
             visual[i] = codepoints[map[i]];
         }
@@ -210,22 +273,42 @@ pub fn logToVisMap(
     const map = try allocator.alloc(u32, len);
     errdefer allocator.free(map);
     initIdentityMap(map);
-
-    var max_level: BidiLevel = base_level;
-    var min_odd: BidiLevel = level_mod.max_resolved_level + 1;
-    for (levels) |l| {
-        if (l > max_level) max_level = l;
-        if (level_mod.isRtl(l) and l < min_odd) min_odd = l;
-    }
-
-    applyL2(map, levels, len, min_odd, max_level);
+    const extents = levelExtents(levels, base_level);
+    applyL2(map, levels, len, extents.min_odd, extents.max_level);
 
     // Convert v_to_l to l_to_v
     const l_to_v = try allocator.alloc(u32, len);
-    for (map, 0..) |logical, visual| {
-        l_to_v[logical] = @intCast(visual);
-    }
+    fillLToVFromVToL(l_to_v, map);
     allocator.free(map);
+
+    return l_to_v;
+}
+
+/// Build logical-to-visual index map from embedding levels using reusable scratch buffers.
+///
+/// Returned slice is owned by `scratch` and remains valid until the next call that
+/// mutates the same scratch object.
+pub fn logToVisScratch(
+    allocator: Allocator,
+    scratch: *LogToVisScratch,
+    levels: []const BidiLevel,
+    base_level: BidiLevel,
+) ![]u32 {
+    const len: u32 = @intCast(levels.len);
+    try scratch.v_to_l.ensureTotalCapacity(allocator, len);
+    scratch.v_to_l.items.len = len;
+    try scratch.l_to_v.ensureTotalCapacity(allocator, len);
+    scratch.l_to_v.items.len = len;
+
+    const v_to_l = scratch.v_to_l.items;
+    const l_to_v = scratch.l_to_v.items;
+
+    if (len > 0) {
+        initIdentityMap(v_to_l);
+        const extents = levelExtents(levels, base_level);
+        applyL2(v_to_l, levels, len, extents.min_odd, extents.max_level);
+        fillLToVFromVToL(l_to_v, v_to_l);
+    }
 
     return l_to_v;
 }
@@ -245,48 +328,43 @@ pub fn visualRuns(
     const v_to_l = try allocator.alloc(u32, len);
     defer allocator.free(v_to_l);
     initIdentityMap(v_to_l);
-
-    var max_level: BidiLevel = base_level;
-    var min_odd: BidiLevel = level_mod.max_resolved_level + 1;
-    for (levels) |l| {
-        if (l > max_level) max_level = l;
-        if (level_mod.isRtl(l) and l < min_odd) min_odd = l;
-    }
-    applyL2(v_to_l, levels, len, min_odd, max_level);
+    const extents = levelExtents(levels, base_level);
+    applyL2(v_to_l, levels, len, extents.min_odd, extents.max_level);
 
     var runs = std.ArrayListUnmanaged(types.VisualRun){};
     errdefer runs.deinit(allocator);
-    try runs.ensureTotalCapacity(allocator, len);
-
-    var visual_idx: u32 = 0;
-    while (visual_idx < len) {
-        const visual_start = visual_idx;
-        const first_logical = v_to_l[visual_idx];
-        const rtl = level_mod.isRtl(levels[first_logical]);
-        const step: i64 = if (rtl) -1 else 1;
-        var prev_logical: i64 = @intCast(first_logical);
-
-        visual_idx += 1;
-        while (visual_idx < len) : (visual_idx += 1) {
-            const logical = v_to_l[visual_idx];
-            if (level_mod.isRtl(levels[logical]) != rtl) break;
-
-            const logical_i64: i64 = @intCast(logical);
-            if (logical_i64 != prev_logical + step) break;
-            prev_logical = logical_i64;
-        }
-
-        const run_len = visual_idx - visual_start;
-        const logical_start = if (rtl) v_to_l[visual_idx - 1] else first_logical;
-        try runs.append(allocator, .{
-            .visual_start = visual_start,
-            .logical_start = logical_start,
-            .len = run_len,
-            .is_rtl = rtl,
-        });
-    }
+    try buildVisualRunsFromVToL(allocator, &runs, v_to_l, levels);
 
     return try runs.toOwnedSlice(allocator);
+}
+
+/// Derive visual runs in visual order from embedding levels using reusable scratch buffers.
+///
+/// Returned slice is owned by `scratch` and remains valid until the next call that
+/// mutates the same scratch object.
+pub fn visualRunsScratch(
+    allocator: Allocator,
+    scratch: *VisualRunsScratch,
+    levels: []const BidiLevel,
+    base_level: BidiLevel,
+) ![]types.VisualRun {
+    const len: u32 = @intCast(levels.len);
+
+    try scratch.v_to_l.ensureTotalCapacity(allocator, len);
+    scratch.v_to_l.items.len = len;
+    scratch.runs.clearRetainingCapacity();
+
+    if (len == 0) {
+        return scratch.runs.items;
+    }
+
+    const v_to_l = scratch.v_to_l.items;
+    initIdentityMap(v_to_l);
+    const extents = levelExtents(levels, base_level);
+    applyL2(v_to_l, levels, len, extents.min_odd, extents.max_level);
+
+    try buildVisualRunsFromVToL(allocator, &scratch.runs, v_to_l, levels);
+    return scratch.runs.items;
 }
 
 /// Remove bidi control marks from a codepoint array.
@@ -319,6 +397,64 @@ fn initIdentityMap(map: anytype) void {
     const T = std.meta.Elem(@TypeOf(map));
     for (0..map.len) |i| {
         map[i] = @as(T, @intCast(i));
+    }
+}
+
+fn fillLToVFromVToL(l_to_v: []u32, v_to_l: []const u32) void {
+    std.debug.assert(l_to_v.len == v_to_l.len);
+    for (v_to_l, 0..) |logical_idx, visual_idx| {
+        l_to_v[logical_idx] = @intCast(visual_idx);
+    }
+}
+
+fn levelExtents(levels: []const BidiLevel, base_level: BidiLevel) LevelExtents {
+    var max_level: BidiLevel = base_level;
+    var min_odd: BidiLevel = level_mod.max_resolved_level + 1;
+    for (levels) |l| {
+        if (l > max_level) max_level = l;
+        if (level_mod.isRtl(l) and l < min_odd) min_odd = l;
+    }
+    return .{
+        .max_level = max_level,
+        .min_odd = min_odd,
+    };
+}
+
+fn buildVisualRunsFromVToL(
+    allocator: Allocator,
+    runs: *std.ArrayListUnmanaged(types.VisualRun),
+    v_to_l: []const u32,
+    levels: []const BidiLevel,
+) !void {
+    const len: u32 = @intCast(v_to_l.len);
+    try runs.ensureTotalCapacity(allocator, len);
+
+    var visual_idx: u32 = 0;
+    while (visual_idx < len) {
+        const visual_start = visual_idx;
+        const first_logical = v_to_l[visual_idx];
+        const rtl = level_mod.isRtl(levels[first_logical]);
+        const step: i64 = if (rtl) -1 else 1;
+        var prev_logical: i64 = @intCast(first_logical);
+
+        visual_idx += 1;
+        while (visual_idx < len) : (visual_idx += 1) {
+            const logical = v_to_l[visual_idx];
+            if (level_mod.isRtl(levels[logical]) != rtl) break;
+
+            const logical_i64: i64 = @intCast(logical);
+            if (logical_i64 != prev_logical + step) break;
+            prev_logical = logical_i64;
+        }
+
+        const run_len = visual_idx - visual_start;
+        const logical_start = if (rtl) v_to_l[visual_idx - 1] else first_logical;
+        try runs.append(allocator, .{
+            .visual_start = visual_start,
+            .logical_start = logical_start,
+            .len = run_len,
+            .is_rtl = rtl,
+        });
     }
 }
 
@@ -384,9 +520,149 @@ fn reorderLineEmptyAllocProbe(allocator: Allocator) !void {
     defer result.deinit();
 }
 
+const CountingAllocator = struct {
+    parent: Allocator,
+    alloc_count: usize = 0,
+
+    fn init(parent: Allocator) CountingAllocator {
+        return .{ .parent = parent };
+    }
+
+    fn allocator(self: *CountingAllocator) Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const ptr = self.parent.rawAlloc(len, alignment, ret_addr);
+        if (ptr != null) self.alloc_count += 1;
+        return ptr;
+    }
+
+    fn resize(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const ok = self.parent.rawResize(buf, alignment, new_len, ret_addr);
+        if (ok and new_len > buf.len) self.alloc_count += 1;
+        return ok;
+    }
+
+    fn remap(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const ptr = self.parent.rawRemap(buf, alignment, new_len, ret_addr);
+        if (ptr != null and new_len > buf.len) self.alloc_count += 1;
+        return ptr;
+    }
+
+    fn free(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.parent.rawFree(buf, alignment, ret_addr);
+    }
+};
+
 test "allocation failure safety: reorderLine empty input" {
     const testing = std.testing;
     try testing.checkAllAllocationFailures(testing.allocator, reorderLineEmptyAllocProbe, .{});
+}
+
+test "reorderLineScratch matches owned API and reuses capacity" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var counter = CountingAllocator.init(gpa);
+    const alloc = counter.allocator();
+
+    var scratch = ReorderLineScratch{};
+    defer scratch.deinit(alloc);
+
+    const cps_big = [_]u21{
+        'H', 'e', 'l', 'l',    'o',    ' ', 0x0645, 0x0631, 0x062D, 0x0628, 0x0627, ' ', '1', '2', '3', ' ',
+        'A', 'B', ' ', 0x05D0, 0x05D1, ' ', 'Z',    '!',
+    };
+    const lv_big = [_]BidiLevel{
+        0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 0, 0, 0, 1, 1, 0, 0, 0,
+    };
+    var expected_big = try reorderLine(gpa, &cps_big, &lv_big, 0);
+    defer expected_big.deinit();
+    const got_big = try reorderLineScratch(alloc, &scratch, &cps_big, &lv_big, 0);
+    try testing.expectEqualSlices(u21, expected_big.visual, got_big.visual);
+    try testing.expectEqualSlices(u32, expected_big.l_to_v, got_big.l_to_v);
+    try testing.expectEqualSlices(u32, expected_big.v_to_l, got_big.v_to_l);
+    try testing.expectEqual(expected_big.max_level, got_big.max_level);
+
+    const alloc_before_second = counter.alloc_count;
+
+    const cps_small = [_]u21{ 'A', ' ', 0x05D0, 0x05D1, ' ', 'B' };
+    const lv_small = [_]BidiLevel{ 0, 0, 1, 1, 0, 0 };
+    var expected_small = try reorderLine(gpa, &cps_small, &lv_small, 0);
+    defer expected_small.deinit();
+    const got_small = try reorderLineScratch(alloc, &scratch, &cps_small, &lv_small, 0);
+
+    try testing.expectEqual(@as(usize, 0), counter.alloc_count - alloc_before_second);
+    try testing.expectEqualSlices(u21, expected_small.visual, got_small.visual);
+    try testing.expectEqualSlices(u32, expected_small.l_to_v, got_small.l_to_v);
+    try testing.expectEqualSlices(u32, expected_small.v_to_l, got_small.v_to_l);
+}
+
+test "visualRunsScratch matches owned API and reuses capacity" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var counter = CountingAllocator.init(gpa);
+    const alloc = counter.allocator();
+
+    var scratch = VisualRunsScratch{};
+    defer scratch.deinit(alloc);
+
+    const lv_big = [_]BidiLevel{ 0, 0, 1, 1, 2, 2, 1, 1, 0, 0, 1, 1, 0 };
+    const expected_big = try visualRuns(gpa, &lv_big, 0);
+    defer gpa.free(expected_big);
+    const got_big = try visualRunsScratch(alloc, &scratch, &lv_big, 0);
+    try testing.expectEqualSlices(types.VisualRun, expected_big, got_big);
+
+    const alloc_before_second = counter.alloc_count;
+
+    const lv_small = [_]BidiLevel{ 1, 1, 2, 2, 1, 1 };
+    const expected_small = try visualRuns(gpa, &lv_small, 1);
+    defer gpa.free(expected_small);
+    const got_small = try visualRunsScratch(alloc, &scratch, &lv_small, 1);
+
+    try testing.expectEqual(@as(usize, 0), counter.alloc_count - alloc_before_second);
+    try testing.expectEqualSlices(types.VisualRun, expected_small, got_small);
+}
+
+test "logToVisScratch matches owned API and reuses capacity" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var counter = CountingAllocator.init(gpa);
+    const alloc = counter.allocator();
+
+    var scratch = LogToVisScratch{};
+    defer scratch.deinit(alloc);
+
+    const lv_big = [_]BidiLevel{ 0, 0, 1, 1, 2, 2, 1, 1, 0, 0 };
+    const expected_big = try logToVisMap(gpa, &lv_big, 0);
+    defer gpa.free(expected_big);
+    const got_big = try logToVisScratch(alloc, &scratch, &lv_big, 0);
+    try testing.expectEqualSlices(u32, expected_big, got_big);
+
+    const alloc_before_second = counter.alloc_count;
+
+    const lv_small = [_]BidiLevel{ 1, 1, 0, 0 };
+    const expected_small = try logToVisMap(gpa, &lv_small, 0);
+    defer gpa.free(expected_small);
+    const got_small = try logToVisScratch(alloc, &scratch, &lv_small, 0);
+
+    try testing.expectEqual(@as(usize, 0), counter.alloc_count - alloc_before_second);
+    try testing.expectEqualSlices(u32, expected_small, got_small);
 }
 
 test "reorder pure LTR" {

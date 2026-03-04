@@ -84,6 +84,12 @@ defer allocator.free(l2v);
 const runs = try itijah.getVisualRuns(allocator, emb.levels, dir.toLevel());
 defer allocator.free(runs);
 
+// Terminal-oriented line layout: levels + runs + maps in one call
+var layout = try itijah.resolveVisualLayout(allocator, codepoints, .{
+    .base_dir = .ltr,
+});
+defer layout.deinit();
+
 // Remove bidi control marks
 const cleaned = try itijah.removeBidiMarks(allocator, codepoints, null);
 defer allocator.free(cleaned.result);
@@ -109,6 +115,75 @@ const visual = try itijah.reorderVisualOnlyScratch(
     dir.toLevel(),
 );
 defer allocator.free(visual);
+
+var line_scratch = itijah.ReorderLineScratch{};
+defer line_scratch.deinit(allocator);
+const line_view = try itijah.reorderLineScratch(
+    allocator,
+    &line_scratch,
+    codepoints,
+    emb.levels,
+    dir.toLevel(),
+);
+_ = line_view; // scratch-owned slices valid until next line_scratch mutation
+
+var runs_scratch = itijah.VisualRunsScratch{};
+defer runs_scratch.deinit(allocator);
+const runs_view = try itijah.getVisualRunsScratch(
+    allocator,
+    &runs_scratch,
+    emb.levels,
+    dir.toLevel(),
+);
+_ = runs_view; // scratch-owned slice
+
+var map_scratch = itijah.LogToVisScratch{};
+defer map_scratch.deinit(allocator);
+const l2v_scratch = try itijah.logToVisScratch(
+    allocator,
+    &map_scratch,
+    emb.levels,
+    dir.toLevel(),
+);
+_ = l2v_scratch; // scratch-owned slice
+
+var layout_scratch = itijah.VisualLayoutScratch{};
+defer layout_scratch.deinit(allocator);
+const layout_view = try itijah.resolveVisualLayoutScratch(
+    allocator,
+    &layout_scratch,
+    codepoints,
+    .{ .base_dir = .ltr },
+);
+_ = layout_view; // scratch-owned slices
+```
+
+## Terminal Integration
+
+Minimal row pipeline (left-anchored terminal row, line-scoped bidi):
+
+```zig
+const layout = try itijah.resolveVisualLayout(allocator, row_codepoints, .{
+    .base_dir = .ltr, // terminal row base direction
+});
+defer layout.deinit();
+
+for (layout.runs) |run| {
+    // Feed shaper in logical order for this run's contiguous logical slice.
+    const logical_start = run.logical_start;
+    const logical_end = run.logical_start + run.len;
+    var logical_i = logical_start;
+    while (logical_i < logical_end) : (logical_i += 1) {
+        // Cluster is visual offset inside the run (terminal-critical mapping).
+        const cluster = itijah.clusterForLogical(run, logical_i);
+        shape_input.append(.{
+            .cp = row_codepoints[logical_i],
+            .cluster = cluster,
+        });
+    }
+
+    // After shaping, place glyphs by visual x for this run.
+}
 ```
 
 ## API / ABI Stability

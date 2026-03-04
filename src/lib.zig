@@ -24,12 +24,36 @@ pub const BidiLevel = level.BidiLevel;
 pub const ParDirection = types.ParDirection;
 pub const EmbeddingResult = types.EmbeddingResult;
 pub const ReorderResult = types.ReorderResult;
+pub const ReorderResultScratchView = types.ReorderResultScratchView;
 pub const VisualRun = types.VisualRun;
+pub const LogicalRange = types.LogicalRange;
+pub const VisualLayout = types.VisualLayout;
+pub const VisualLayoutScratchView = types.VisualLayoutScratchView;
+pub const LayoutOptions = types.LayoutOptions;
 pub const EmbeddingScratch = embedding.EmbeddingScratch;
 pub const ReorderScratch = reorder.ReorderScratch;
+pub const ReorderLineScratch = reorder.ReorderLineScratch;
+pub const VisualRunsScratch = reorder.VisualRunsScratch;
+pub const LogToVisScratch = reorder.LogToVisScratch;
 pub const ReorderFlags = types.ReorderFlags;
 pub const ShapeFlags = types.ShapeFlags;
 pub const BidiClass = unicode.BidiClass;
+
+pub const VisualLayoutScratch = struct {
+    embedding: EmbeddingScratch = .{},
+    log_to_vis: LogToVisScratch = .{},
+    visual_runs: VisualRunsScratch = .{},
+    levels: std.ArrayListUnmanaged(BidiLevel) = .{},
+    v_to_l: std.ArrayListUnmanaged(u32) = .{},
+
+    pub fn deinit(self: *VisualLayoutScratch, allocator: Allocator) void {
+        self.embedding.deinit(allocator);
+        self.log_to_vis.deinit(allocator);
+        self.visual_runs.deinit(allocator);
+        self.levels.deinit(allocator);
+        self.v_to_l.deinit(allocator);
+    }
+};
 
 /// Get paragraph embedding levels for a sequence of codepoints.
 /// Implements UAX #9 Rules P2-P3, X1-X8, W1-W7, N0-N2, I1-I2, L1.
@@ -67,6 +91,20 @@ pub fn reorderLine(
     return reorder.reorderLine(allocator, codepoints, levels, base_level);
 }
 
+/// Reorder a line with reusable scratch buffers.
+///
+/// Returned slices are owned by `scratch` and remain valid until the next call that
+/// mutates the same scratch object.
+pub fn reorderLineScratch(
+    allocator: Allocator,
+    scratch: *ReorderLineScratch,
+    codepoints: []const u21,
+    levels: []const BidiLevel,
+    base_level: BidiLevel,
+) !ReorderResultScratchView {
+    return reorder.reorderLineScratch(allocator, scratch, codepoints, levels, base_level);
+}
+
 /// Reorder a line and return only visual codepoints.
 pub fn reorderVisualOnly(
     allocator: Allocator,
@@ -97,6 +135,19 @@ pub fn logToVis(
     return reorder.logToVisMap(allocator, levels, base_level);
 }
 
+/// Build a logical-to-visual index map with reusable scratch buffers.
+///
+/// Returned slice is owned by `scratch` and remains valid until the next call that
+/// mutates the same scratch object.
+pub fn logToVisScratch(
+    allocator: Allocator,
+    scratch: *LogToVisScratch,
+    levels: []const BidiLevel,
+    base_level: BidiLevel,
+) ![]u32 {
+    return reorder.logToVisScratch(allocator, scratch, levels, base_level);
+}
+
 /// Derive visual runs in visual order from embedding levels.
 pub fn getVisualRuns(
     allocator: Allocator,
@@ -104,6 +155,118 @@ pub fn getVisualRuns(
     base_level: BidiLevel,
 ) ![]VisualRun {
     return reorder.visualRuns(allocator, levels, base_level);
+}
+
+/// Derive visual runs with reusable scratch buffers.
+///
+/// Returned slice is owned by `scratch` and remains valid until the next call that
+/// mutates the same scratch object.
+pub fn getVisualRunsScratch(
+    allocator: Allocator,
+    scratch: *VisualRunsScratch,
+    levels: []const BidiLevel,
+    base_level: BidiLevel,
+) ![]VisualRun {
+    return reorder.visualRunsScratch(allocator, scratch, levels, base_level);
+}
+
+/// Resolve terminal-oriented visual layout for a single line.
+///
+/// This composes embedding-level resolution + visual runs + index maps.
+/// Rows are line-scoped; no paragraph alignment behavior is applied.
+pub fn resolveVisualLayout(
+    allocator: Allocator,
+    codepoints: []const u21,
+    opts: LayoutOptions,
+) !VisualLayout {
+    var dir = opts.base_dir;
+    var emb = try getParEmbeddingLevels(allocator, codepoints, &dir);
+    errdefer emb.deinit();
+
+    const base_level = dir.toLevel();
+    const l_to_v = try logToVis(allocator, emb.levels, base_level);
+    errdefer allocator.free(l_to_v);
+
+    const v_to_l = try allocator.alloc(u32, l_to_v.len);
+    errdefer allocator.free(v_to_l);
+    for (l_to_v, 0..) |visual_idx, logical_idx| {
+        v_to_l[visual_idx] = @intCast(logical_idx);
+    }
+
+    const runs = try getVisualRuns(allocator, emb.levels, base_level);
+    errdefer allocator.free(runs);
+
+    return .{
+        .levels = emb.levels,
+        .runs = runs,
+        .l_to_v = l_to_v,
+        .v_to_l = v_to_l,
+        .base_level = base_level,
+        .allocator = allocator,
+    };
+}
+
+/// Resolve terminal-oriented visual layout with reusable scratch buffers.
+///
+/// Returned slices are scratch-owned and remain valid until the next call that
+/// mutates the same scratch object.
+pub fn resolveVisualLayoutScratch(
+    allocator: Allocator,
+    scratch: *VisualLayoutScratch,
+    codepoints: []const u21,
+    opts: LayoutOptions,
+) !VisualLayoutScratchView {
+    var dir = opts.base_dir;
+    var emb = try getParEmbeddingLevelsScratch(allocator, &scratch.embedding, codepoints, &dir);
+    defer emb.deinit();
+
+    try scratch.levels.ensureTotalCapacity(allocator, emb.levels.len);
+    scratch.levels.items.len = emb.levels.len;
+    @memcpy(scratch.levels.items, emb.levels);
+
+    const base_level = dir.toLevel();
+    const l_to_v = try logToVisScratch(
+        allocator,
+        &scratch.log_to_vis,
+        scratch.levels.items,
+        base_level,
+    );
+    try scratch.v_to_l.ensureTotalCapacity(allocator, l_to_v.len);
+    scratch.v_to_l.items.len = l_to_v.len;
+    const v_to_l = scratch.v_to_l.items;
+    for (l_to_v, 0..) |visual_idx, logical_idx| {
+        v_to_l[visual_idx] = @intCast(logical_idx);
+    }
+
+    const runs = try getVisualRunsScratch(allocator, &scratch.visual_runs, scratch.levels.items, base_level);
+
+    return .{
+        .levels = scratch.levels.items,
+        .runs = runs,
+        .l_to_v = l_to_v,
+        .v_to_l = v_to_l,
+        .base_level = base_level,
+    };
+}
+
+pub fn logicalIndexForVisual(run: VisualRun, visual_index: u32) u32 {
+    return types.logicalIndexForVisual(run, visual_index);
+}
+
+pub fn visualIndexForLogical(run: VisualRun, logical_index: u32) u32 {
+    return types.visualIndexForLogical(run, logical_index);
+}
+
+pub fn logicalRangeForVisualSlice(
+    run: VisualRun,
+    visual_start: u32,
+    visual_end: u32,
+) LogicalRange {
+    return types.logicalRangeForVisualSlice(run, visual_start, visual_end);
+}
+
+pub fn clusterForLogical(run: VisualRun, logical_index: u32) u32 {
+    return types.clusterForLogical(run, logical_index);
 }
 
 /// Remove bidi control marks (LRM, RLM, ALM, LRE, RLE, PDF, LRO, RLO, LRI, RLI, FSI, PDI)
@@ -152,6 +315,7 @@ test {
     _ = @import("test/conformance.zig");
     _ = @import("test/parity.zig");
     _ = @import("test/invariants.zig");
+    _ = @import("test/layout.zig");
 }
 
 test "end-to-end: pure LTR" {

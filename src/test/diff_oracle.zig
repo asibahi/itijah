@@ -357,18 +357,14 @@ fn chooseLength(random: std.Random, max_len: usize) usize {
 }
 
 fn runItijah(allocator: Allocator, cps: []const u21) !OracleResult {
-    var dir: itijah.ParDirection = .auto_ltr;
-    var emb = try itijah.getParEmbeddingLevels(allocator, cps, &dir);
-    defer emb.deinit();
+    var layout = try itijah.resolveVisualLayout(allocator, cps, .{ .base_dir = .auto_ltr });
+    defer layout.deinit();
 
-    var vis = try itijah.reorderLine(allocator, cps, emb.levels, dir.toLevel());
-    defer vis.deinit();
-
-    const levels = try allocator.alloc(u8, emb.levels.len);
+    const levels = try allocator.alloc(u8, layout.levels.len);
     errdefer allocator.free(levels);
-    for (emb.levels, 0..) |lvl, i| levels[i] = lvl;
+    for (layout.levels, 0..) |lvl, i| levels[i] = lvl;
 
-    const v_to_l = try allocator.dupe(u32, vis.v_to_l);
+    const v_to_l = try allocator.dupe(u32, layout.v_to_l);
     return .{ .levels = levels, .v_to_l = v_to_l };
 }
 
