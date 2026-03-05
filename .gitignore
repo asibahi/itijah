@@ -16,3 +16,6 @@ zig-out/
 # Local environment files
 .env
 .env.*
+
+# Temporary files
+tmp/

@@ -4,9 +4,9 @@ Zig-native implementation of the Unicode Bidirectional Algorithm ([UAX #9](https
 
 Codepoint-based API inspired by FriBidi's design, implemented idiomatically in Zig with no global state and explicit allocator passing. Competitive with FriBidi and ICU; faster on LTR and mixed-direction text, with scratch APIs for allocation-light high-throughput loops.
 
-## Status: Phase 1
+## Status
 
-### Implemented (Phase 1)
+### Implemented
 
 | Rule | Description | Status |
 |------|------------|--------|
@@ -20,14 +20,21 @@ Codepoint-based API inspired by FriBidi's design, implemented idiomatically in Z
 | L1 | Reset segment/paragraph separators | Done (parts 1-3) |
 | L2 | Reorder by level | Done |
 
-### Not Yet Implemented (Phase 2)
+### Not yet implemented
 
 | Rule | Description |
 |------|------------|
 | L3 | Combining mark (NSM) reordering |
 | L4 | Mirroring (data table ready, application pending) |
-| Arabic joining | Rules R1-R7 (stub returns `error.NotImplemented`) |
-| Arabic shaping | Presentation forms (stub returns `error.NotImplemented`) |
+
+These are cosmetic refinements that don't affect terminal integration — terminal shapers (HarfBuzz, CoreText) handle combining marks and mirroring at the glyph level.
+
+### Roadmap
+
+- **L3/L4 completion** — combining mark reordering and mirroring application for non-shaper consumers
+- **Arabic joining (R1-R7)** — currently out of scope; handled by shaping engines (HarfBuzz, CoreText) in terminal/GUI contexts
+- **Arabic shaping (presentation forms)** — useful for environments without a shaper
+- **C ABI wrapper** — stable binary interface for non-Zig consumers
 
 ## Validation
 
