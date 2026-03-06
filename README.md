@@ -236,7 +236,7 @@ brew install fribidi icu4c
 
 Detailed tables, environment, and methodology: [docs/benchmarks.md](docs/benchmarks.md).
 
-`bench-compare` measures `itijah` vs `zabadi` (if present locally), `fribidi`, and ICU across `analysis` and `reorder_line` for LTR/RTL/MIXED corpora at `16`, `64`, `256`, `512`, `1024`, with optional huge sizes `262144`, `524288`, and `1048576`.
+`bench-compare` measures `itijah` vs [`zabadi`](https://git.sr.ht/~asibahi/zabadi), [`fribidi`](https://github.com/fribidi/fribidi), and [ICU](https://unicode-org.github.io/icu/userguide/icu4c/) across `analysis` and `reorder_line` for LTR/RTL/MIXED corpora at `16`, `64`, `256`, `512`, `1024`, with optional huge sizes `262144`, `524288`, and `1048576`.
 
 ```sh
 zig build bench                                        # itijah-only report
