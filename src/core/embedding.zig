@@ -31,25 +31,64 @@ const LevelRun = struct {
 };
 
 const IsolatingRunSequence = struct {
-    run_indices: []usize,
+    run_indices: []const u32,
     sos: BidiClass,
     eos: BidiClass,
 };
 
 const IsolatingRunSequences = struct {
     sequences: []IsolatingRunSequence,
-    run_indices_pool: []usize,
+    run_indices_pool: []u32,
+};
+
+const IsolatingSeqMeta = struct {
+    head: i32,
+    tail: i32,
+    has_items: bool,
+};
+
+const IsolatingSeqNode = struct {
+    level_run_idx: u32,
+    next: i32,
+};
+
+const BracketPair = struct {
+    open_run_idx: u32,
+    close_run_idx: u32,
+};
+
+const BracketInfo = struct {
+    cp: u21,
+    is_open: bool,
 };
 
 pub const EmbeddingScratch = struct {
     classes: ArrayList(BidiClass) = .{},
     runs: ArrayList(Run) = .{},
     level_runs: ArrayList(LevelRun) = .{},
+    levels: ArrayList(BidiLevel) = .{},
+    run_indices_pool: ArrayList(u32) = .{},
+    sequences: ArrayList(IsolatingRunSequence) = .{},
+    irs_stack: ArrayList(u32) = .{},
+    irs_finished: ArrayList(u32) = .{},
+    irs_seq_meta: ArrayList(IsolatingSeqMeta) = .{},
+    irs_seq_nodes: ArrayList(IsolatingSeqNode) = .{},
+    et_run_indices: ArrayList(u32) = .{},
+    bracket_pairs: ArrayList(BracketPair) = .{},
 
     pub fn deinit(self: *EmbeddingScratch, allocator: Allocator) void {
         self.classes.deinit(allocator);
         self.runs.deinit(allocator);
         self.level_runs.deinit(allocator);
+        self.levels.deinit(allocator);
+        self.run_indices_pool.deinit(allocator);
+        self.sequences.deinit(allocator);
+        self.irs_stack.deinit(allocator);
+        self.irs_finished.deinit(allocator);
+        self.irs_seq_meta.deinit(allocator);
+        self.irs_seq_nodes.deinit(allocator);
+        self.et_run_indices.deinit(allocator);
+        self.bracket_pairs.deinit(allocator);
     }
 };
 
@@ -86,6 +125,54 @@ fn requiresWeakGranularity(class: BidiClass) bool {
     };
 }
 
+fn isRtlOrNonLtrStrong(class: BidiClass) bool {
+    return switch (class) {
+        .right_to_left,
+        .right_to_left_arabic,
+        .arabic_number,
+        => true,
+        else => false,
+    };
+}
+
+fn canUseSimpleLtrFastPath(par_dir: ParDirection, classes: []const BidiClass) bool {
+    if (par_dir != .ltr and par_dir != .auto_ltr) return false;
+
+    for (classes) |class| {
+        if (class == .left_to_right) continue;
+        if (isRtlOrNonLtrStrong(class)) return false;
+        if (requiresExplicitGranularity(class)) return false;
+        if (requiresWeakGranularity(class)) return false;
+        if (unicode.isIsolateInitiator(class) or class == .pop_directional_isolate) return false;
+        if (class == .european_number or class == .arabic_number) return false;
+    }
+    return true;
+}
+
+fn canUseLtrAllZeroResolvedFastPath(par_dir: ParDirection, classes: []const BidiClass) bool {
+    if (par_dir != .ltr and par_dir != .auto_ltr) return false;
+
+    for (classes) |class| {
+        switch (class) {
+            .right_to_left,
+            .right_to_left_arabic,
+            .arabic_number,
+            .left_to_right_embedding,
+            .right_to_left_embedding,
+            .left_to_right_override,
+            .right_to_left_override,
+            .pop_directional_format,
+            .left_to_right_isolate,
+            .right_to_left_isolate,
+            .first_strong_isolate,
+            .pop_directional_isolate,
+            => return false,
+            else => {},
+        }
+    }
+    return true;
+}
+
 /// Resolve paragraph embedding levels for a codepoint sequence.
 /// Implements Rules P2-P3, X1-X8, W1-W7, N0-N2, I1-I2.
 pub fn getParEmbeddingLevels(
@@ -112,7 +199,6 @@ pub fn getParEmbeddingLevels(
     }
 
     // Fast path: non-RTL paragraph request with all-L input resolves trivially.
-    // This is common in LTR-only text and avoids full UBA machinery.
     if (par_dir.* != .rtl) {
         var all_ltr = true;
         for (classes) |class| {
@@ -131,6 +217,31 @@ pub fn getParEmbeddingLevels(
                 .allocator = allocator,
             };
         }
+    }
+
+    // Fast path: explicit/weak-free LTR text (spaces/punctuation/separators only around L).
+    if (canUseSimpleLtrFastPath(par_dir.*, classes)) {
+        const levels = try allocator.alloc(BidiLevel, len);
+        @memset(levels, level_mod.ltr_level);
+        par_dir.* = .ltr;
+        return .{
+            .levels = levels,
+            .resolved_par_dir = .ltr,
+            .allocator = allocator,
+        };
+    }
+
+    // Fast path: no RTL-driving classes and no explicit/isolate controls in LTR paragraph.
+    // Under these constraints, all resolved levels are 0.
+    if (canUseLtrAllZeroResolvedFastPath(par_dir.*, classes)) {
+        const levels = try allocator.alloc(BidiLevel, len);
+        @memset(levels, level_mod.ltr_level);
+        par_dir.* = .ltr;
+        return .{
+            .levels = levels,
+            .resolved_par_dir = .ltr,
+            .allocator = allocator,
+        };
     }
 
     // P2-P3: Determine paragraph level
@@ -197,20 +308,22 @@ pub fn getParEmbeddingLevels(
 }
 
 /// Resolve paragraph embedding levels using reusable scratch buffers.
-pub fn getParEmbeddingLevelsScratch(
+///
+/// Returned levels are owned by `scratch` and remain valid until the next call that
+/// mutates the same scratch object.
+pub fn getParEmbeddingLevelsScratchView(
     allocator: Allocator,
     scratch: *EmbeddingScratch,
     codepoints: []const u21,
     par_dir: *ParDirection,
-) !types.EmbeddingResult {
+) !types.EmbeddingScratchView {
     const len = codepoints.len;
     const len_u32: u32 = @intCast(len);
     if (len == 0) {
-        const levels = try allocator.alloc(BidiLevel, 0);
+        scratch.levels.items.len = 0;
         return .{
-            .levels = levels,
+            .levels = scratch.levels.items,
             .resolved_par_dir = if (par_dir.isAuto()) .ltr else par_dir.*,
-            .allocator = allocator,
         };
     }
 
@@ -224,7 +337,6 @@ pub fn getParEmbeddingLevelsScratch(
     }
 
     // Fast path: non-RTL paragraph request with all-L input resolves trivially.
-    // This is common in LTR-only text and avoids full UBA machinery.
     if (par_dir.* != .rtl) {
         var all_ltr = true;
         for (classes) |class| {
@@ -234,15 +346,38 @@ pub fn getParEmbeddingLevelsScratch(
             }
         }
         if (all_ltr) {
-            const levels = try allocator.alloc(BidiLevel, len);
-            @memset(levels, level_mod.ltr_level);
+            try scratch.levels.ensureTotalCapacity(allocator, len);
+            scratch.levels.items.len = len;
+            @memset(scratch.levels.items, level_mod.ltr_level);
             par_dir.* = .ltr;
             return .{
-                .levels = levels,
+                .levels = scratch.levels.items,
                 .resolved_par_dir = .ltr,
-                .allocator = allocator,
             };
         }
+    }
+
+    // Fast path: explicit/weak-free LTR text (spaces/punctuation/separators only around L).
+    if (canUseSimpleLtrFastPath(par_dir.*, classes)) {
+        try scratch.levels.ensureTotalCapacity(allocator, len);
+        scratch.levels.items.len = len;
+        @memset(scratch.levels.items, level_mod.ltr_level);
+        par_dir.* = .ltr;
+        return .{
+            .levels = scratch.levels.items,
+            .resolved_par_dir = .ltr,
+        };
+    }
+
+    if (canUseLtrAllZeroResolvedFastPath(par_dir.*, classes)) {
+        try scratch.levels.ensureTotalCapacity(allocator, len);
+        scratch.levels.items.len = len;
+        @memset(scratch.levels.items, level_mod.ltr_level);
+        par_dir.* = .ltr;
+        return .{
+            .levels = scratch.levels.items,
+            .resolved_par_dir = .ltr,
+        };
     }
 
     // P2-P3: Determine paragraph level
@@ -273,34 +408,58 @@ pub fn getParEmbeddingLevelsScratch(
 
     // X10: Build isolating run sequences for W/N processing.
     const level_runs = try computeLevelRunsScratch(allocator, scratch, scratch.runs.items);
-    const sequences_data = try computeIsolatingRunSequences(allocator, scratch.runs.items, level_runs, base_level);
-    defer deinitIsolatingRunSequences(allocator, sequences_data);
-    const sequences = sequences_data.sequences;
-
-    // W1-W7: Resolve weak types per isolating run sequence.
-    try resolveWeak(allocator, scratch.runs.items, sequences);
-
-    // N0-N2: Resolve brackets and neutrals per isolating run sequence.
-    try resolveBracketsAndNeutrals(allocator, codepoints, scratch.runs.items, sequences);
+    const sequences = if (runsHaveIsolates(scratch.runs.items))
+        try computeIsolatingRunSequencesScratch(
+            allocator,
+            scratch,
+            scratch.runs.items,
+            level_runs,
+            base_level,
+        )
+    else
+        try computeIsolatingRunSequencesNoIsolatesScratch(
+            allocator,
+            scratch,
+            scratch.runs.items,
+            level_runs,
+            base_level,
+        );
+    try resolveWeakWithEtBuffer(allocator, &scratch.et_run_indices, scratch.runs.items, sequences);
+    try resolveBracketsAndNeutralsScratch(allocator, scratch, codepoints, scratch.runs.items, sequences);
 
     // I1-I2: Resolve implicit levels
     resolveImplicit(scratch.runs.items);
 
-    // Fill final levels from runs
-    const levels = try allocator.alloc(BidiLevel, len);
-    errdefer allocator.free(levels);
-    fillLevelsFromRuns(scratch.runs.items, levels);
+    // Fill final levels from runs.
+    try scratch.levels.ensureTotalCapacity(allocator, len);
+    scratch.levels.items.len = len;
+    fillLevelsFromRuns(scratch.runs.items, scratch.levels.items);
 
     // Match X9 reinsertion behavior: removed codes inherit the previous
     // resolved level (or paragraph level at index 0) so they don't perturb L2.
-    setRemovedLevelsFromPreceding(levels, classes, base_level);
+    setRemovedLevelsFromPreceding(scratch.levels.items, classes, base_level);
 
     // L1 (parts 1-3): Reset levels for segment/paragraph separators and whitespace before them
-    applyL1(levels, classes, base_level);
+    applyL1(scratch.levels.items, classes, base_level);
 
     return .{
-        .levels = levels,
+        .levels = scratch.levels.items,
         .resolved_par_dir = resolved_dir,
+    };
+}
+
+/// Resolve paragraph embedding levels using reusable scratch buffers.
+pub fn getParEmbeddingLevelsScratch(
+    allocator: Allocator,
+    scratch: *EmbeddingScratch,
+    codepoints: []const u21,
+    par_dir: *ParDirection,
+) !types.EmbeddingResult {
+    const view = try getParEmbeddingLevelsScratchView(allocator, scratch, codepoints, par_dir);
+    const levels = try allocator.dupe(BidiLevel, view.levels);
+    return .{
+        .levels = levels,
+        .resolved_par_dir = view.resolved_par_dir,
         .allocator = allocator,
     };
 }
@@ -336,7 +495,7 @@ fn buildRuns(
     var i: u32 = 0;
     while (i < len) {
         const class = classes[i];
-        const bracket = pairedBracketInfo(codepoints[i]);
+        const bracket = pairedBracketInfoForClass(class, codepoints[i]);
         const start = i;
         i += 1;
 
@@ -369,7 +528,7 @@ fn buildRuns(
         // Merge consecutive same-class runs when no per-codepoint handling is required.
         while (i < len and
             classes[i] == class and
-            pairedBracketInfo(codepoints[i]).cp == 0 and
+            pairedBracketInfoForClass(classes[i], codepoints[i]).cp == 0 and
             !unicode.isIsolate(classes[i]) and
             !requiresExplicitGranularity(classes[i]) and
             !requiresWeakGranularity(classes[i]))
@@ -405,7 +564,7 @@ fn estimateRunCount(classes: []const BidiClass, codepoints: []const u21, len: u3
     var count: usize = 0;
     while (i < len) {
         const class = classes[i];
-        const bcp = pairedBracketInfo(codepoints[i]).cp;
+        const bcp = pairedBracketInfoForClass(class, codepoints[i]).cp;
         i += 1;
         count += 1;
 
@@ -415,7 +574,7 @@ fn estimateRunCount(classes: []const BidiClass, codepoints: []const u21, len: u3
 
         while (i < len and
             classes[i] == class and
-            pairedBracketInfo(codepoints[i]).cp == 0 and
+            pairedBracketInfoForClass(classes[i], codepoints[i]).cp == 0 and
             !unicode.isIsolate(classes[i]) and
             !requiresExplicitGranularity(classes[i]) and
             !requiresWeakGranularity(classes[i]))
@@ -426,7 +585,17 @@ fn estimateRunCount(classes: []const BidiClass, codepoints: []const u21, len: u3
     return count;
 }
 
-fn pairedBracketInfo(cp: u21) struct { cp: u21, is_open: bool } {
+fn pairedBracketInfoForClass(class: BidiClass, cp: u21) BracketInfo {
+    if (class != .other_neutrals) {
+        return .{
+            .cp = 0,
+            .is_open = false,
+        };
+    }
+    return pairedBracketInfo(cp);
+}
+
+fn pairedBracketInfo(cp: u21) BracketInfo {
     const normalized_cp = unicode.normalizeBidiBracketCp(cp);
     const bpb = unicode.pairedBracket(normalized_cp);
     return switch (bpb) {
@@ -773,8 +942,180 @@ fn computeLevelRunsScratch(
     return out;
 }
 
+fn computeIsolatingRunSequencesNoIsolatesScratch(
+    allocator: Allocator,
+    scratch: *EmbeddingScratch,
+    runs: []const Run,
+    level_runs: []const LevelRun,
+    base_level: BidiLevel,
+) ![]const IsolatingRunSequence {
+    try scratch.sequences.ensureTotalCapacity(allocator, level_runs.len);
+    scratch.sequences.items.len = level_runs.len;
+
+    var total_run_indices: usize = 0;
+    for (level_runs) |range| {
+        total_run_indices += range.end - range.start;
+    }
+
+    try scratch.run_indices_pool.ensureTotalCapacity(allocator, total_run_indices);
+    scratch.run_indices_pool.items.len = total_run_indices;
+
+    var pool_offset: usize = 0;
+    for (level_runs, 0..) |range, i| {
+        const start = pool_offset;
+        for (range.start..range.end) |run_idx| {
+            scratch.run_indices_pool.items[pool_offset] = @intCast(run_idx);
+            pool_offset += 1;
+        }
+        const run_indices = scratch.run_indices_pool.items[start..pool_offset];
+        const se = computeSequenceSosEos(runs, run_indices, base_level);
+        scratch.sequences.items[i] = .{
+            .run_indices = run_indices,
+            .sos = se.sos,
+            .eos = se.eos,
+        };
+    }
+
+    return scratch.sequences.items;
+}
+
+fn computeIsolatingRunSequencesScratch(
+    allocator: Allocator,
+    scratch: *EmbeddingScratch,
+    runs: []const Run,
+    level_runs: []const LevelRun,
+    base_level: BidiLevel,
+) ![]const IsolatingRunSequence {
+    scratch.sequences.clearRetainingCapacity();
+    scratch.run_indices_pool.clearRetainingCapacity();
+    scratch.irs_stack.clearRetainingCapacity();
+    scratch.irs_finished.clearRetainingCapacity();
+    scratch.irs_seq_meta.clearRetainingCapacity();
+    scratch.irs_seq_nodes.clearRetainingCapacity();
+
+    if (level_runs.len == 0) {
+        return scratch.sequences.items;
+    }
+
+    try scratch.irs_stack.ensureTotalCapacity(allocator, level_runs.len + 1);
+    try scratch.irs_finished.ensureTotalCapacity(allocator, level_runs.len);
+    try scratch.irs_seq_meta.ensureTotalCapacity(allocator, level_runs.len + 1);
+    try scratch.irs_seq_nodes.ensureTotalCapacity(allocator, level_runs.len);
+
+    try scratch.irs_seq_meta.append(allocator, .{
+        .head = -1,
+        .tail = -1,
+        .has_items = false,
+    });
+    try scratch.irs_stack.append(allocator, 0);
+
+    for (level_runs, 0..) |level_run, level_run_idx| {
+        const start_class = runs[level_run.start].class;
+        const end_class = blk: {
+            var i = level_run.end;
+            while (i > level_run.start) {
+                i -= 1;
+                if (!unicode.isRemovedByX9(runs[i].class)) break :blk runs[i].class;
+            }
+            break :blk start_class;
+        };
+
+        const seq_idx: u32 = if (start_class == .pop_directional_isolate and scratch.irs_stack.items.len > 1) blk: {
+            const top = scratch.irs_stack.items.len - 1;
+            const idx = scratch.irs_stack.items[top];
+            scratch.irs_stack.items.len = top;
+            break :blk idx;
+        } else blk: {
+            const idx: u32 = @intCast(scratch.irs_seq_meta.items.len);
+            try scratch.irs_seq_meta.append(allocator, .{
+                .head = -1,
+                .tail = -1,
+                .has_items = false,
+            });
+            break :blk idx;
+        };
+
+        const node_idx: i32 = @intCast(scratch.irs_seq_nodes.items.len);
+        try scratch.irs_seq_nodes.append(allocator, .{
+            .level_run_idx = @intCast(level_run_idx),
+            .next = -1,
+        });
+
+        var seq_meta = &scratch.irs_seq_meta.items[seq_idx];
+        if (!seq_meta.has_items) {
+            seq_meta.head = node_idx;
+            seq_meta.tail = node_idx;
+            seq_meta.has_items = true;
+        } else {
+            const tail_idx: usize = @intCast(seq_meta.tail);
+            scratch.irs_seq_nodes.items[tail_idx].next = node_idx;
+            seq_meta.tail = node_idx;
+        }
+
+        if (unicode.isIsolateInitiator(end_class)) {
+            try scratch.irs_stack.append(allocator, seq_idx);
+        } else {
+            try scratch.irs_finished.append(allocator, seq_idx);
+        }
+    }
+
+    while (scratch.irs_stack.items.len > 0) {
+        const top = scratch.irs_stack.items.len - 1;
+        const seq_idx = scratch.irs_stack.items[top];
+        scratch.irs_stack.items.len = top;
+        if (!scratch.irs_seq_meta.items[seq_idx].has_items) continue;
+        try scratch.irs_finished.append(allocator, seq_idx);
+    }
+
+    try scratch.sequences.ensureTotalCapacity(allocator, scratch.irs_finished.items.len);
+    scratch.sequences.items.len = scratch.irs_finished.items.len;
+
+    var total_run_indices: usize = 0;
+    for (scratch.irs_finished.items) |seq_idx| {
+        var node_idx = scratch.irs_seq_meta.items[seq_idx].head;
+        while (node_idx >= 0) {
+            const node = scratch.irs_seq_nodes.items[@intCast(node_idx)];
+            const level_run = level_runs[node.level_run_idx];
+            total_run_indices += level_run.end - level_run.start;
+            node_idx = node.next;
+        }
+    }
+
+    try scratch.run_indices_pool.ensureTotalCapacity(allocator, total_run_indices);
+    scratch.run_indices_pool.items.len = total_run_indices;
+
+    var pool_offset: usize = 0;
+    for (scratch.irs_finished.items, 0..) |seq_idx, seq_out_idx| {
+        const start = pool_offset;
+        var node_idx = scratch.irs_seq_meta.items[seq_idx].head;
+        while (node_idx >= 0) {
+            const node = scratch.irs_seq_nodes.items[@intCast(node_idx)];
+            const level_run = level_runs[node.level_run_idx];
+            for (level_run.start..level_run.end) |run_idx| {
+                scratch.run_indices_pool.items[pool_offset] = @intCast(run_idx);
+                pool_offset += 1;
+            }
+            node_idx = node.next;
+        }
+
+        const run_indices = scratch.run_indices_pool.items[start..pool_offset];
+        const se = computeSequenceSosEos(runs, run_indices, base_level);
+        scratch.sequences.items[seq_out_idx] = .{
+            .run_indices = run_indices,
+            .sos = se.sos,
+            .eos = se.eos,
+        };
+    }
+
+    return scratch.sequences.items;
+}
+
 fn classFromLevel(level: BidiLevel) BidiClass {
     return if (level_mod.isRtl(level)) .right_to_left else .left_to_right;
+}
+
+fn runIndexToUsize(run_idx: u32) usize {
+    return @intCast(run_idx);
 }
 
 fn typeAnEnAsRtl(class: BidiClass) BidiClass {
@@ -793,31 +1134,32 @@ fn implicitLevelForStrong(level: BidiLevel, strong_class: BidiClass) BidiLevel {
     return level + @as(BidiLevel, @intFromBool(level_mod.isRtl(level) != strong_is_rtl));
 }
 
-fn firstNonRemovedRun(runs: []const Run, seq: []const usize) ?usize {
+fn firstNonRemovedRun(runs: []const Run, seq: []const u32) ?usize {
     for (seq) |run_idx| {
-        if (!unicode.isRemovedByX9(runs[run_idx].class)) return run_idx;
+        const run_idx_usize = runIndexToUsize(run_idx);
+        if (!unicode.isRemovedByX9(runs[run_idx_usize].class)) return run_idx_usize;
     }
     return null;
 }
 
-fn lastNonRemovedRun(runs: []const Run, seq: []const usize) ?usize {
+fn lastNonRemovedRun(runs: []const Run, seq: []const u32) ?usize {
     var i = seq.len;
     while (i > 0) {
         i -= 1;
-        const run_idx = seq[i];
+        const run_idx = runIndexToUsize(seq[i]);
         if (!unicode.isRemovedByX9(runs[run_idx].class)) return run_idx;
     }
     return null;
 }
 
-fn computeSequenceSosEos(runs: []const Run, seq: []const usize, base_level: BidiLevel) struct { sos: BidiClass, eos: BidiClass } {
-    const first_non_removed = firstNonRemovedRun(runs, seq) orelse seq[0];
-    const last_non_removed = lastNonRemovedRun(runs, seq) orelse seq[seq.len - 1];
+fn computeSequenceSosEos(runs: []const Run, seq: []const u32, base_level: BidiLevel) struct { sos: BidiClass, eos: BidiClass } {
+    const first_non_removed = firstNonRemovedRun(runs, seq) orelse runIndexToUsize(seq[0]);
+    const last_non_removed = lastNonRemovedRun(runs, seq) orelse runIndexToUsize(seq[seq.len - 1]);
 
     const seq_level = runs[first_non_removed].level;
     const end_level = runs[last_non_removed].level;
 
-    const start_run_idx = seq[0];
+    const start_run_idx = runIndexToUsize(seq[0]);
     const pred_level: BidiLevel = blk: {
         var i = start_run_idx;
         while (i > 0) {
@@ -831,7 +1173,7 @@ fn computeSequenceSosEos(runs: []const Run, seq: []const usize, base_level: Bidi
         const last_class = runs[last_non_removed].class;
         if (unicode.isIsolateInitiator(last_class)) break :blk base_level;
 
-        var i = seq[seq.len - 1] + 1;
+        var i = runIndexToUsize(seq[seq.len - 1]) + 1;
         while (i < runs.len) : (i += 1) {
             if (!unicode.isRemovedByX9(runs[i].class)) break :blk runs[i].level;
         }
@@ -847,6 +1189,13 @@ fn computeSequenceSosEos(runs: []const Run, seq: []const usize, base_level: Bidi
 fn deinitIsolatingRunSequences(allocator: Allocator, sequences_data: IsolatingRunSequences) void {
     allocator.free(sequences_data.run_indices_pool);
     allocator.free(sequences_data.sequences);
+}
+
+fn runsHaveIsolates(runs: []const Run) bool {
+    for (runs) |run| {
+        if (unicode.isIsolate(run.class)) return true;
+    }
+    return false;
 }
 
 fn computeIsolatingRunSequences(
@@ -866,19 +1215,50 @@ fn computeIsolatingRunSequences(
     if (level_runs.len == 0) {
         const sequences = try allocator.alloc(IsolatingRunSequence, 0);
         errdefer allocator.free(sequences);
-        const run_indices_pool = try allocator.alloc(usize, 0);
+        const run_indices_pool = try allocator.alloc(u32, 0);
         return .{
             .sequences = sequences,
             .run_indices_pool = run_indices_pool,
         };
     }
 
-    var has_isolates = false;
-    for (runs) |run| {
-        if (unicode.isIsolate(run.class)) {
-            has_isolates = true;
-            break;
+    const has_isolates = runsHaveIsolates(runs);
+
+    // Common fast path: no isolate controls in input.
+    // Avoid temporary per-sequence builders and directly materialize
+    // flattened IRS run-index slices.
+    if (!has_isolates) {
+        const sequences = try allocator.alloc(IsolatingRunSequence, level_runs.len);
+        errdefer allocator.free(sequences);
+
+        var total_run_indices: usize = 0;
+        for (level_runs) |range| {
+            total_run_indices += range.end - range.start;
         }
+
+        const run_indices_pool = try allocator.alloc(u32, total_run_indices);
+        errdefer allocator.free(run_indices_pool);
+
+        var pool_offset: usize = 0;
+        for (level_runs, 0..) |range, i| {
+            const start = pool_offset;
+            for (range.start..range.end) |run_idx| {
+                run_indices_pool[pool_offset] = @intCast(run_idx);
+                pool_offset += 1;
+            }
+            const run_indices = run_indices_pool[start..pool_offset];
+            const se = computeSequenceSosEos(runs, run_indices, base_level);
+            sequences[i] = .{
+                .run_indices = run_indices,
+                .sos = se.sos,
+                .eos = se.eos,
+            };
+        }
+
+        return .{
+            .sequences = sequences,
+            .run_indices_pool = run_indices_pool,
+        };
     }
 
     var finished = ArrayList(SequenceBuilder){};
@@ -957,7 +1337,7 @@ fn computeIsolatingRunSequences(
         }
     }
 
-    const run_indices_pool = try allocator.alloc(usize, total_run_indices);
+    const run_indices_pool = try allocator.alloc(u32, total_run_indices);
     errdefer allocator.free(run_indices_pool);
 
     var pool_offset: usize = 0;
@@ -965,7 +1345,7 @@ fn computeIsolatingRunSequences(
         const start = pool_offset;
         for (seq_builder.ranges.items) |range| {
             for (range.start..range.end) |run_idx| {
-                run_indices_pool[pool_offset] = run_idx;
+                run_indices_pool[pool_offset] = @intCast(run_idx);
                 pool_offset += 1;
             }
         }
@@ -992,17 +1372,19 @@ fn findNextNonBnInSequence(
 ) BidiClass {
     var pos = start_pos;
     while (pos < seq.run_indices.len) : (pos += 1) {
-        const run_idx = seq.run_indices[pos];
+        const run_idx = runIndexToUsize(seq.run_indices[pos]);
         const class = runs[run_idx].class;
         if (class != .boundary_neutral) return class;
     }
     return fallback;
 }
 
-fn resolveWeak(allocator: Allocator, runs: []Run, sequences: []const IsolatingRunSequence) !void {
-    var et_run_indices = ArrayList(usize){};
-    defer et_run_indices.deinit(allocator);
-
+fn resolveWeakWithEtBuffer(
+    allocator: Allocator,
+    et_run_indices: *ArrayList(u32),
+    runs: []Run,
+    sequences: []const IsolatingRunSequence,
+) !void {
     for (sequences) |seq| {
         try et_run_indices.ensureTotalCapacity(allocator, seq.run_indices.len);
         et_run_indices.clearRetainingCapacity();
@@ -1014,8 +1396,9 @@ fn resolveWeak(allocator: Allocator, runs: []Run, sequences: []const IsolatingRu
         @memset(last_strong_w2[0..], seq.sos);
 
         for (seq.run_indices, 0..) |run_idx, pos| {
-            var class = runs[run_idx].class;
-            const iso_level = @min(@as(usize, runs[run_idx].isolate_level), last_strong_w2.len - 1);
+            const run_idx_usize = runIndexToUsize(run_idx);
+            var class = runs[run_idx_usize].class;
+            const iso_level = @min(@as(usize, runs[run_idx_usize].isolate_level), last_strong_w2.len - 1);
             if (class == .boundary_neutral) {
                 continue;
             }
@@ -1032,7 +1415,7 @@ fn resolveWeak(allocator: Allocator, runs: []Run, sequences: []const IsolatingRu
                     => .other_neutrals,
                     else => prev_class_before_w1,
                 };
-                runs[run_idx].class = class;
+                runs[run_idx_usize].class = class;
                 w2_class = class;
             }
             prev_class_before_w1 = class;
@@ -1043,7 +1426,7 @@ fn resolveWeak(allocator: Allocator, runs: []Run, sequences: []const IsolatingRu
             } else if (class == .right_to_left_arabic) {
                 class = .right_to_left;
             }
-            runs[run_idx].class = class;
+            runs[run_idx_usize].class = class;
 
             switch (w2_class) {
                 .left_to_right,
@@ -1059,7 +1442,7 @@ fn resolveWeak(allocator: Allocator, runs: []Run, sequences: []const IsolatingRu
             switch (class) {
                 .european_number => {
                     for (et_run_indices.items) |idx| {
-                        runs[idx].class = .european_number;
+                        runs[runIndexToUsize(idx)].class = .european_number;
                     }
                     et_run_indices.clearRetainingCapacity();
                 },
@@ -1076,11 +1459,11 @@ fn resolveWeak(allocator: Allocator, runs: []Run, sequences: []const IsolatingRu
                         }
                         break :blk .other_neutrals;
                     };
-                    runs[run_idx].class = class;
+                    runs[run_idx_usize].class = class;
                 },
                 .european_number_terminator => {
                     if (prev_class_before_w5 == .european_number) {
-                        runs[run_idx].class = .european_number;
+                        runs[run_idx_usize].class = .european_number;
                     } else {
                         et_run_indices.appendAssumeCapacity(run_idx);
                     }
@@ -1088,12 +1471,12 @@ fn resolveWeak(allocator: Allocator, runs: []Run, sequences: []const IsolatingRu
                 else => {},
             }
 
-            prev_class_before_w5 = runs[run_idx].class;
+            prev_class_before_w5 = runs[run_idx_usize].class;
 
             // W6 (terminators)
             if (prev_class_before_w5 != .european_number_terminator) {
                 for (et_run_indices.items) |idx| {
-                    runs[idx].class = .other_neutrals;
+                    runs[runIndexToUsize(idx)].class = .other_neutrals;
                 }
                 et_run_indices.clearRetainingCapacity();
             }
@@ -1102,36 +1485,44 @@ fn resolveWeak(allocator: Allocator, runs: []Run, sequences: []const IsolatingRu
         }
 
         for (et_run_indices.items) |idx| {
-            runs[idx].class = .other_neutrals;
+            runs[runIndexToUsize(idx)].class = .other_neutrals;
         }
         et_run_indices.clearRetainingCapacity();
 
         // W7
         var last_strong_w7: [max_depth + 2]BidiClass = undefined;
         @memset(last_strong_w7[0..], seq.sos);
-        var prev_non_bn_run_idx: ?usize = null;
+        var prev_non_bn_run_idx: ?u32 = null;
         for (seq.run_indices) |run_idx| {
-            if (runs[run_idx].class == .boundary_neutral) continue;
-            const iso_level = @min(@as(usize, runs[run_idx].isolate_level), last_strong_w7.len - 1);
+            const run_idx_usize = runIndexToUsize(run_idx);
+            if (runs[run_idx_usize].class == .boundary_neutral) continue;
+            const iso_level = @min(@as(usize, runs[run_idx_usize].isolate_level), last_strong_w7.len - 1);
 
             const prev_type = if (prev_non_bn_run_idx) |prev_idx| blk: {
-                if (runs[prev_idx].level == runs[run_idx].level) {
-                    break :blk runs[prev_idx].class;
+                const prev_idx_usize = runIndexToUsize(prev_idx);
+                if (runs[prev_idx_usize].level == runs[run_idx_usize].level) {
+                    break :blk runs[prev_idx_usize].class;
                 }
-                break :blk classFromLevel(@max(runs[prev_idx].level, runs[run_idx].level));
+                break :blk classFromLevel(@max(runs[prev_idx_usize].level, runs[run_idx_usize].level));
             } else seq.sos;
 
             if (prev_type == .left_to_right or prev_type == .right_to_left) {
                 last_strong_w7[iso_level] = prev_type;
             }
 
-            if (runs[run_idx].class == .european_number and last_strong_w7[iso_level] == .left_to_right) {
-                runs[run_idx].class = .left_to_right;
+            if (runs[run_idx_usize].class == .european_number and last_strong_w7[iso_level] == .left_to_right) {
+                runs[run_idx_usize].class = .left_to_right;
             }
 
             prev_non_bn_run_idx = run_idx;
         }
     }
+}
+
+fn resolveWeak(allocator: Allocator, runs: []Run, sequences: []const IsolatingRunSequence) !void {
+    var et_run_indices = ArrayList(u32){};
+    defer et_run_indices.deinit(allocator);
+    try resolveWeakWithEtBuffer(allocator, &et_run_indices, runs, sequences);
 }
 
 fn isNi(class: BidiClass) bool {
@@ -1149,23 +1540,20 @@ fn isNi(class: BidiClass) bool {
     };
 }
 
-const BracketPair = struct {
-    open_run_idx: usize,
-    close_run_idx: usize,
-};
-
 const OpenEntry = struct {
     run_idx: u32,
     paired_close: u21,
 };
 
-fn collectBracketPairsPerSequence(
+fn collectBracketPairsPerSequenceInto(
     allocator: Allocator,
+    pairs: *ArrayList(BracketPair),
     codepoints: []const u21,
     runs: []const Run,
     sequences: []const IsolatingRunSequence,
-) ![]BracketPair {
-    if (sequences.len == 0) return try allocator.alloc(BracketPair, 0);
+) !void {
+    pairs.clearRetainingCapacity();
+    if (sequences.len == 0) return;
 
     var bracket_candidate_count: usize = 0;
     for (runs) |run| {
@@ -1173,9 +1561,6 @@ fn collectBracketPairsPerSequence(
             bracket_candidate_count += 1;
         }
     }
-
-    var pairs = ArrayList(BracketPair){};
-    errdefer pairs.deinit(allocator);
     try pairs.ensureTotalCapacity(allocator, bracket_candidate_count / 2);
 
     for (sequences) |seq| {
@@ -1186,7 +1571,8 @@ fn collectBracketPairsPerSequence(
 
         // UAX #9 BD16: bracket pairing is evaluated per IRS using a stack.
         for (seq.run_indices) |run_idx| {
-            const run = runs[run_idx];
+            const run_idx_usize = runIndexToUsize(run_idx);
+            const run = runs[run_idx_usize];
             if (unicode.isRemovedByX9(run.class)) continue;
 
             if (run.bracket_cp != 0 and run.class == .other_neutrals) {
@@ -1229,30 +1615,32 @@ fn collectBracketPairsPerSequence(
             return a.open_run_idx < b.open_run_idx;
         }
     }.lessThan);
+}
 
+fn collectBracketPairsPerSequence(
+    allocator: Allocator,
+    codepoints: []const u21,
+    runs: []const Run,
+    sequences: []const IsolatingRunSequence,
+) ![]BracketPair {
+    var pairs = ArrayList(BracketPair){};
+    errdefer pairs.deinit(allocator);
+    try collectBracketPairsPerSequenceInto(allocator, &pairs, codepoints, runs, sequences);
     return try pairs.toOwnedSlice(allocator);
 }
 
-fn resolveBracketsAndNeutrals(
-    allocator: Allocator,
-    codepoints: []const u21,
-    runs: []Run,
-    sequences: []const IsolatingRunSequence,
-) !void {
-    if (runs.len == 0) return;
-
-    const pairs = try collectBracketPairsPerSequence(allocator, codepoints, runs, sequences);
-    defer allocator.free(pairs);
-
+fn applyBracketPairsN0(runs: []Run, pairs: []const BracketPair) void {
     for (pairs) |pair| {
-        const embedding_level = runs[pair.open_run_idx].level;
-        const pair_iso_level = runs[pair.open_run_idx].isolate_level;
+        const open_run_idx = runIndexToUsize(pair.open_run_idx);
+        const close_run_idx = runIndexToUsize(pair.close_run_idx);
+        const embedding_level = runs[open_run_idx].level;
+        const pair_iso_level = runs[open_run_idx].isolate_level;
 
         var class_to_set: ?BidiClass = null;
 
         // N0b: strong type inside pair matching the embedding level.
-        var run_idx = pair.open_run_idx;
-        while (run_idx < pair.close_run_idx) : (run_idx += 1) {
+        var run_idx = open_run_idx;
+        while (run_idx < close_run_idx) : (run_idx += 1) {
             const strong_t = typeAnEnAsRtl(runs[run_idx].class);
             if (!isStrongForN0(strong_t)) continue;
 
@@ -1267,7 +1655,7 @@ fn resolveBracketsAndNeutrals(
         if (class_to_set == null) {
             var prec_strong_level = embedding_level;
 
-            var back_run_idx = pair.open_run_idx;
+            var back_run_idx = open_run_idx;
             while (back_run_idx > 0) {
                 back_run_idx -= 1;
                 const strong_t = typeAnEnAsRtl(runs[back_run_idx].class);
@@ -1277,8 +1665,8 @@ fn resolveBracketsAndNeutrals(
                 break;
             }
 
-            run_idx = pair.open_run_idx;
-            while (run_idx < pair.close_run_idx) : (run_idx += 1) {
+            run_idx = open_run_idx;
+            while (run_idx < close_run_idx) : (run_idx += 1) {
                 const strong_t = typeAnEnAsRtl(runs[run_idx].class);
                 if (!isStrongForN0(strong_t)) continue;
 
@@ -1288,10 +1676,10 @@ fn resolveBracketsAndNeutrals(
         }
 
         if (class_to_set) |new_class| {
-            runs[pair.open_run_idx].class = new_class;
-            runs[pair.close_run_idx].class = new_class;
+            runs[open_run_idx].class = new_class;
+            runs[close_run_idx].class = new_class;
 
-            run_idx = pair.open_run_idx + 1;
+            run_idx = open_run_idx + 1;
             while (run_idx < runs.len) : (run_idx += 1) {
                 if (runs[run_idx].isolate_level != pair_iso_level) break;
                 if (runs[run_idx].class == .boundary_neutral) continue;
@@ -1300,7 +1688,7 @@ fn resolveBracketsAndNeutrals(
                 } else break;
             }
 
-            run_idx = pair.close_run_idx + 1;
+            run_idx = close_run_idx + 1;
             while (run_idx < runs.len) : (run_idx += 1) {
                 if (runs[run_idx].isolate_level != pair_iso_level) break;
                 if (runs[run_idx].class == .boundary_neutral) continue;
@@ -1310,12 +1698,14 @@ fn resolveBracketsAndNeutrals(
             }
         }
     }
+}
 
+fn resolveNeutralsN1N2(runs: []Run, sequences: []const IsolatingRunSequence) void {
     for (sequences) |seq| {
         // N1-N2
         var run_pos: usize = 0;
         while (run_pos < seq.run_indices.len) {
-            const idx = seq.run_indices[run_pos];
+            const idx = runIndexToUsize(seq.run_indices[run_pos]);
             const class = runs[idx].class;
 
             if (class == .boundary_neutral) {
@@ -1325,11 +1715,11 @@ fn resolveBracketsAndNeutrals(
 
             if (isNi(class)) {
                 const ni_start = run_pos;
-                const ni_level = runs[seq.run_indices[ni_start]].level;
+                const ni_level = runs[runIndexToUsize(seq.run_indices[ni_start])].level;
                 const ni_e = classFromLevel(ni_level);
                 run_pos += 1;
                 while (run_pos < seq.run_indices.len) : (run_pos += 1) {
-                    const c = runs[seq.run_indices[run_pos]].class;
+                    const c = runs[runIndexToUsize(seq.run_indices[run_pos])].class;
                     if (!(isNi(c) or c == .boundary_neutral)) break;
                 }
 
@@ -1337,7 +1727,7 @@ fn resolveBracketsAndNeutrals(
                     var p = ni_start;
                     while (p > 0) {
                         p -= 1;
-                        const prev_idx = seq.run_indices[p];
+                        const prev_idx = runIndexToUsize(seq.run_indices[p]);
                         if (runs[prev_idx].class == .boundary_neutral) continue;
                         if (runs[prev_idx].level == ni_level) {
                             break :blk typeAnEnAsRtl(runs[prev_idx].class);
@@ -1350,7 +1740,7 @@ fn resolveBracketsAndNeutrals(
                 const next_type: BidiClass = blk: {
                     var p = run_pos;
                     while (p < seq.run_indices.len) : (p += 1) {
-                        const next_idx = seq.run_indices[p];
+                        const next_idx = runIndexToUsize(seq.run_indices[p]);
                         if (runs[next_idx].class == .boundary_neutral) continue;
                         if (runs[next_idx].level == ni_level) {
                             break :blk typeAnEnAsRtl(runs[next_idx].class);
@@ -1363,7 +1753,7 @@ fn resolveBracketsAndNeutrals(
                 const new_class: BidiClass = if (prev_type == next_type) prev_type else ni_e;
 
                 for (ni_start..run_pos) |p| {
-                    const ni_idx = seq.run_indices[p];
+                    const ni_idx = runIndexToUsize(seq.run_indices[p]);
                     if (runs[ni_idx].class != .boundary_neutral) {
                         runs[ni_idx].class = new_class;
                     }
@@ -1374,6 +1764,62 @@ fn resolveBracketsAndNeutrals(
             run_pos += 1;
         }
     }
+}
+
+fn resolveBracketsAndNeutrals(
+    allocator: Allocator,
+    codepoints: []const u21,
+    runs: []Run,
+    sequences: []const IsolatingRunSequence,
+) !void {
+    if (runs.len == 0) return;
+
+    var has_bracket_candidates = false;
+    for (runs) |run| {
+        if (run.bracket_cp != 0 and run.class == .other_neutrals) {
+            has_bracket_candidates = true;
+            break;
+        }
+    }
+
+    if (has_bracket_candidates) {
+        const pairs = try collectBracketPairsPerSequence(allocator, codepoints, runs, sequences);
+        defer allocator.free(pairs);
+        applyBracketPairsN0(runs, pairs);
+    }
+
+    resolveNeutralsN1N2(runs, sequences);
+}
+
+fn resolveBracketsAndNeutralsScratch(
+    allocator: Allocator,
+    scratch: *EmbeddingScratch,
+    codepoints: []const u21,
+    runs: []Run,
+    sequences: []const IsolatingRunSequence,
+) !void {
+    if (runs.len == 0) return;
+
+    var has_bracket_candidates = false;
+    for (runs) |run| {
+        if (run.bracket_cp != 0 and run.class == .other_neutrals) {
+            has_bracket_candidates = true;
+            break;
+        }
+    }
+
+    if (has_bracket_candidates) {
+        try collectBracketPairsPerSequenceInto(
+            allocator,
+            &scratch.bracket_pairs,
+            codepoints,
+            runs,
+            sequences,
+        );
+        applyBracketPairsN0(runs, scratch.bracket_pairs.items);
+    }
+
+    resolveNeutralsN1N2(runs, sequences);
 }
 
 /// I1-I2: Resolve implicit levels.
@@ -1619,14 +2065,14 @@ test "spec target: N0 does not pair across disjoint IRS at same isolate level" {
     @memset(run_to_seq, -1);
     for (sequences_data.sequences, 0..) |seq, seq_idx| {
         for (seq.run_indices) |run_idx| {
-            run_to_seq[run_idx] = @intCast(seq_idx);
+            run_to_seq[runIndexToUsize(run_idx)] = @intCast(seq_idx);
         }
     }
 
     var cross_irs_pairs: usize = 0;
     for (pairs) |pair| {
-        const s_open = run_to_seq[pair.open_run_idx];
-        const s_close = run_to_seq[pair.close_run_idx];
+        const s_open = run_to_seq[runIndexToUsize(pair.open_run_idx)];
+        const s_close = run_to_seq[runIndexToUsize(pair.close_run_idx)];
         try testing.expectEqual(s_open, s_close);
         if (s_open != -1 and s_close != -1 and s_open != s_close) {
             cross_irs_pairs += 1;
@@ -1901,6 +2347,31 @@ test "scratch API matches default API" {
 
     try testing.expectEqual(dir_default, dir_scratch);
     try testing.expectEqualSlices(BidiLevel, result_default.levels, result_scratch.levels);
+}
+
+test "scratch view API matches default API and reuses capacity" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var scratch = EmbeddingScratch{};
+    defer scratch.deinit(gpa);
+
+    const input_big = [_]u21{
+        'a', 'b', ' ', 0x05D0, 0x05D1, ' ', '(', '1', '2', ')', ' ', 0x2067, 0x0627, 0x2069, 'Z',
+    };
+    var dir_default: ParDirection = .auto_ltr;
+    var result_default = try getParEmbeddingLevels(gpa, &input_big, &dir_default);
+    defer result_default.deinit();
+
+    var dir_view: ParDirection = .auto_ltr;
+    const view_big = try getParEmbeddingLevelsScratchView(gpa, &scratch, &input_big, &dir_view);
+    try testing.expectEqual(dir_default, dir_view);
+    try testing.expectEqualSlices(BidiLevel, result_default.levels, view_big.levels);
+
+    const input_small = [_]u21{ 'A', ' ', 0x05D0, 0x05D1 };
+    var dir_small: ParDirection = .auto_ltr;
+    const view_small = try getParEmbeddingLevelsScratchView(gpa, &scratch, &input_small, &dir_small);
+    try testing.expectEqual(@as(usize, input_small.len), view_small.levels.len);
 }
 
 test "memory leak check" {

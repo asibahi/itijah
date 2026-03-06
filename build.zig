@@ -92,6 +92,30 @@ pub fn build(b: *std.Build) void {
             });
             compare_mod.addImport("itijah", internal_mod);
 
+            const compare_options = b.addOptions();
+            var have_zabadi = false;
+            if (std.fs.cwd().access("../zabadi/src/lib.zig", .{})) |_| {
+                have_zabadi = true;
+                const zabadi_mod = b.createModule(.{
+                    .root_source_file = .{ .cwd_relative = "../zabadi/src/lib.zig" },
+                    .target = b.graph.host,
+                    .optimize = .ReleaseFast,
+                });
+                const zabadi_uucode_fields: []const []const u8 = &.{
+                    "bidi_class",
+                    "bidi_paired_bracket",
+                };
+                const zabadi_uucode = uucode orelse b.dependency("uucode", .{
+                    .target = b.graph.host,
+                    .optimize = .ReleaseFast,
+                    .fields = zabadi_uucode_fields,
+                }).module("uucode");
+                zabadi_mod.addImport("uucode", zabadi_uucode);
+                compare_mod.addImport("zabadi", zabadi_mod);
+            } else |_| {}
+            compare_options.addOption(bool, "have_zabadi", have_zabadi);
+            compare_mod.addImport("itijah_compare_options", compare_options.createModule());
+
             const compare_exe = b.addExecutable(.{
                 .name = "itijah-compare",
                 .root_module = compare_mod,
@@ -102,7 +126,7 @@ pub fn build(b: *std.Build) void {
             });
 
             const run_compare = b.addRunArtifact(compare_exe);
-            const compare_step = b.step("bench-compare", "Run itijah vs fribidi vs ICU comparison benchmark");
+            const compare_step = b.step("bench-compare", "Run itijah vs fribidi vs ICU comparison benchmark (optionally zabadi)");
             compare_step.dependOn(&run_compare.step);
         } else |_| {}
     } else |_| {}

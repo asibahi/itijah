@@ -1,5 +1,8 @@
 const std = @import("std");
 const itijah = @import("itijah");
+const compare_options = @import("itijah_compare_options");
+const have_zabadi = compare_options.have_zabadi;
+const zbd = if (have_zabadi) @import("zabadi") else struct {};
 
 const c = @cImport({
     @cInclude("fribidi/fribidi.h");
@@ -14,12 +17,11 @@ const Allocator = std.mem.Allocator;
 const Op = enum {
     analysis,
     reorder_line,
-    resolve_visual_layout,
-    resolve_visual_layout_scratch,
 };
 
 const Impl = enum {
     itijah,
+    zabadi,
     fribidi,
     icu,
 };
@@ -161,12 +163,10 @@ const MeasuringAllocator = struct {
 const ItijahScratchContext = struct {
     embedding: itijah.EmbeddingScratch = .{},
     reorder: itijah.ReorderScratch = .{},
-    layout: itijah.VisualLayoutScratch = .{},
 
     fn deinit(self: *ItijahScratchContext, allocator: Allocator) void {
         self.embedding.deinit(allocator);
         self.reorder.deinit(allocator);
-        self.layout.deinit(allocator);
     }
 };
 
@@ -195,7 +195,6 @@ const UErrorCode = c_int;
 const U_ZERO_ERROR: UErrorCode = 0;
 const UBIDI_DEFAULT_LTR: UBiDiLevel = 0xFE;
 const huge_lengths = [_]usize{ 262_144, 524_288, 1_048_576 };
-
 const CorpusKind = enum {
     ltr,
     rtl,
@@ -383,30 +382,18 @@ const bench_cases = [_]Case{
     .{ .name = "LTR-256", .cps = &ltr_256 },
     .{ .name = "LTR-512", .cps = &ltr_512 },
     .{ .name = "LTR-1024", .cps = &ltr_1024 },
-    .{ .name = "LTR-2048", .cps = &ltr_2048 },
-    .{ .name = "LTR-4096", .cps = &ltr_4096 },
-    .{ .name = "LTR-8192", .cps = &ltr_8192 },
-    .{ .name = "LTR-16384", .cps = &ltr_16384 },
 
     .{ .name = "RTL-16", .cps = &rtl_16 },
     .{ .name = "RTL-64", .cps = &rtl_64 },
     .{ .name = "RTL-256", .cps = &rtl_256 },
     .{ .name = "RTL-512", .cps = &rtl_512 },
     .{ .name = "RTL-1024", .cps = &rtl_1024 },
-    .{ .name = "RTL-2048", .cps = &rtl_2048 },
-    .{ .name = "RTL-4096", .cps = &rtl_4096 },
-    .{ .name = "RTL-8192", .cps = &rtl_8192 },
-    .{ .name = "RTL-16384", .cps = &rtl_16384 },
 
     .{ .name = "MIXED-16", .cps = &mixed_16 },
     .{ .name = "MIXED-64", .cps = &mixed_64 },
     .{ .name = "MIXED-256", .cps = &mixed_256 },
     .{ .name = "MIXED-512", .cps = &mixed_512 },
     .{ .name = "MIXED-1024", .cps = &mixed_1024 },
-    .{ .name = "MIXED-2048", .cps = &mixed_2048 },
-    .{ .name = "MIXED-4096", .cps = &mixed_4096 },
-    .{ .name = "MIXED-8192", .cps = &mixed_8192 },
-    .{ .name = "MIXED-16384", .cps = &mixed_16384 },
 };
 
 fn encodeUtf16(allocator: Allocator, cps: []const u21) ![]u16 {
@@ -421,6 +408,19 @@ fn encodeUtf16(allocator: Allocator, cps: []const u21) ![]u16 {
             try out.append(allocator, @intCast(0xD800 + (x >> 10)));
             try out.append(allocator, @intCast(0xDC00 + (x & 0x3FF)));
         }
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
+
+fn encodeUtf8(allocator: Allocator, cps: []const u21) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8){};
+    errdefer out.deinit(allocator);
+
+    var scratch: [4]u8 = undefined;
+    for (cps) |cp| {
+        const len = try std.unicode.utf8Encode(cp, &scratch);
+        try out.appendSlice(allocator, scratch[0..len]);
     }
 
     return try out.toOwnedSlice(allocator);
@@ -522,10 +522,6 @@ fn runItijah(allocator: Allocator, op: Op, cps: []const u21) !void {
             const visual = try itijah.reorderVisualOnly(allocator, cps, emb.levels, dir.toLevel());
             allocator.free(visual);
         },
-        .resolve_visual_layout, .resolve_visual_layout_scratch => {
-            var layout = try itijah.resolveVisualLayout(allocator, cps, .{ .base_dir = .ltr });
-            layout.deinit();
-        },
     }
 }
 
@@ -536,23 +532,34 @@ fn runItijahScratch(
     cps: []const u21,
 ) !void {
     switch (op) {
-        .analysis, .reorder_line => {
+        .analysis => {
             var dir: itijah.ParDirection = .auto_ltr;
-            var emb = try itijah.getParEmbeddingLevelsScratch(allocator, &ctx.embedding, cps, &dir);
-            defer emb.deinit();
+            _ = try itijah.getParEmbeddingLevelsScratchView(allocator, &ctx.embedding, cps, &dir);
+        },
+        .reorder_line => {
+            var dir: itijah.ParDirection = .auto_ltr;
+            const emb = try itijah.getParEmbeddingLevelsScratchView(allocator, &ctx.embedding, cps, &dir);
+            _ = try itijah.reorderVisualOnlyScratch(allocator, &ctx.reorder, cps, emb.levels, dir.toLevel());
+        },
+    }
+}
 
-            if (op == .reorder_line) {
-                const visual = try itijah.reorderVisualOnlyScratch(allocator, &ctx.reorder, cps, emb.levels, dir.toLevel());
-                allocator.free(visual);
-            }
-        },
-        .resolve_visual_layout => {
-            var layout = try itijah.resolveVisualLayout(allocator, cps, .{ .base_dir = .ltr });
-            layout.deinit();
-        },
-        .resolve_visual_layout_scratch => {
-            _ = try itijah.resolveVisualLayoutScratch(allocator, &ctx.layout, cps, .{ .base_dir = .ltr });
-        },
+fn runZabadi(allocator: Allocator, op: Op, utf8: []const u8) !void {
+    if (!have_zabadi) return error.ZabadiUnavailable;
+
+    var info = try zbd.BidiInfo.new(
+        allocator,
+        utf8,
+        zbd.data.hardcoded_data(),
+        null,
+    );
+    defer info.deinit(allocator);
+
+    if (op == .reorder_line) {
+        for (info.paragraphs) |para| {
+            const reordered = try info.reorder_line(allocator, para, para.range);
+            defer if (reordered) |owned| allocator.free(owned);
+        }
     }
 }
 
@@ -757,15 +764,6 @@ fn parityOnlyMode() bool {
     return std.mem.eql(u8, flag, "1") or std.ascii.eqlIgnoreCase(flag, "true");
 }
 
-fn itijahScratchMode() bool {
-    const flag = std.process.getEnvVarOwned(std.heap.page_allocator, "ITIJAH_COMPARE_ITIJAH_REUSE") catch |err| switch (err) {
-        error.EnvironmentVariableNotFound => return false,
-        else => return false,
-    };
-    defer std.heap.page_allocator.free(flag);
-    return std.mem.eql(u8, flag, "1") or std.ascii.eqlIgnoreCase(flag, "true");
-}
-
 fn includeHugeMode() bool {
     const flag = std.process.getEnvVarOwned(std.heap.page_allocator, "ITIJAH_COMPARE_INCLUDE_HUGE") catch |err| switch (err) {
         error.EnvironmentVariableNotFound => return false,
@@ -810,6 +808,7 @@ fn measureOne(
     impl: Impl,
     op: Op,
     cps: []const u21,
+    utf8: []const u8,
     utf16: []const u16,
     icu: *const IcuApi,
     fribidi_buffers: ?*FribidiBuffers,
@@ -822,6 +821,21 @@ fn measureOne(
 
             var timer = try std.time.Timer.start();
             try runItijah(alloc, op, cps);
+            return .{
+                .ns = timer.read(),
+                .alloc_count = m.allocation_count,
+                .allocated_bytes = m.allocated_bytes,
+                .peak_bytes = m.peak_bytes,
+            };
+        },
+        .zabadi => {
+            if (!have_zabadi) return error.ZabadiUnavailable;
+
+            var m = MeasuringAllocator.init(std.heap.c_allocator);
+            const alloc = m.allocator();
+
+            var timer = try std.time.Timer.start();
+            try runZabadi(alloc, op, utf8);
             return .{
                 .ns = timer.read(),
                 .alloc_count = m.allocation_count,
@@ -844,6 +858,7 @@ fn measureOne(
                 .fribidi => try runFribidi(op, cps, fribidi_buffers orelse return error.MissingBenchBuffers),
                 .icu => try runIcu(icu, op, utf16, icu_buffers orelse return error.MissingBenchBuffers),
                 .itijah => unreachable,
+                .zabadi => unreachable,
             }
             const ns = timer.read();
             itijah_fribidi_probe_finish(&alloc_count, &allocated_bytes, &peak_bytes);
@@ -901,11 +916,11 @@ fn bench(
     case: Case,
     impl: Impl,
     op: Op,
+    utf8: []const u8,
     utf16: []const u16,
     icu: *const IcuApi,
-    itijah_reuse: bool,
 ) !void {
-    if (impl == .itijah and itijah_reuse) {
+    if (impl == .itijah) {
         return benchItijahScratch(writer, case, op);
     }
 
@@ -927,6 +942,7 @@ fn bench(
             impl,
             op,
             case.cps,
+            utf8,
             utf16,
             icu,
             if (fribidi_buffers) |*buf| buf else null,
@@ -941,6 +957,7 @@ fn bench(
             impl,
             op,
             case.cps,
+            utf8,
             utf16,
             icu,
             if (fribidi_buffers) |*buf| buf else null,
@@ -973,22 +990,26 @@ fn runBenchCase(
     allocator: Allocator,
     case: Case,
     icu: *const IcuApi,
-    itijah_reuse: bool,
 ) !void {
+    const utf8 = if (have_zabadi) try encodeUtf8(allocator, case.cps) else &[_]u8{};
+    defer if (have_zabadi) allocator.free(utf8);
+
     const utf16 = try encodeUtf16(allocator, case.cps);
     defer allocator.free(utf16);
 
-    try bench(writer, case, .itijah, .analysis, utf16, icu, itijah_reuse);
-    try bench(writer, case, .fribidi, .analysis, utf16, icu, itijah_reuse);
-    try bench(writer, case, .icu, .analysis, utf16, icu, itijah_reuse);
+    try bench(writer, case, .itijah, .analysis, utf8, utf16, icu);
+    if (have_zabadi) {
+        try bench(writer, case, .zabadi, .analysis, utf8, utf16, icu);
+    }
+    try bench(writer, case, .fribidi, .analysis, utf8, utf16, icu);
+    try bench(writer, case, .icu, .analysis, utf8, utf16, icu);
 
-    try bench(writer, case, .itijah, .reorder_line, utf16, icu, itijah_reuse);
-    try bench(writer, case, .fribidi, .reorder_line, utf16, icu, itijah_reuse);
-    try bench(writer, case, .icu, .reorder_line, utf16, icu, itijah_reuse);
-
-    // Terminal-focused API paths.
-    try bench(writer, case, .itijah, .resolve_visual_layout, utf16, icu, false);
-    try bench(writer, case, .itijah, .resolve_visual_layout_scratch, utf16, icu, true);
+    try bench(writer, case, .itijah, .reorder_line, utf8, utf16, icu);
+    if (have_zabadi) {
+        try bench(writer, case, .zabadi, .reorder_line, utf8, utf16, icu);
+    }
+    try bench(writer, case, .fribidi, .reorder_line, utf8, utf16, icu);
+    try bench(writer, case, .icu, .reorder_line, utf8, utf16, icu);
 }
 
 pub fn main() !void {
@@ -1000,12 +1021,16 @@ pub fn main() !void {
     defer icu.deinit();
 
     const alloc = std.heap.c_allocator;
-
     var buf: [16384]u8 = undefined;
     var stdout = std.fs.File.stdout().writer(&buf);
     const writer = &stdout.interface;
 
-    try writer.writeAll("comparison benchmark (itijah vs fribidi vs icu)\n");
+    if (have_zabadi) {
+        try writer.writeAll("comparison benchmark (itijah vs zabadi vs fribidi vs icu)\n");
+    } else {
+        try writer.writeAll("comparison benchmark (itijah vs fribidi vs icu)\n");
+        try writer.writeAll("note: zabadi not found at ../zabadi/src/lib.zig; skipping zabadi rows\n");
+    }
     try writer.writeAll("feature parity check vs fribidi (exact levels + visual map):\n");
     var parity_ok: usize = 0;
     for (parity_cases) |case| {
@@ -1032,10 +1057,7 @@ pub fn main() !void {
         return;
     }
 
-    const itijah_reuse = itijahScratchMode();
-    if (itijah_reuse) {
-        try writer.writeAll("mode: itijah scratch reuse enabled (ITIJAH_COMPARE_ITIJAH_REUSE=1)\n");
-    }
+    try writer.writeAll("mode: itijah scratch-only paths enabled\n");
     const include_huge = includeHugeMode();
     if (include_huge) {
         try writer.writeAll("mode: huge corpus set enabled (ITIJAH_COMPARE_INCLUDE_HUGE=1)\n");
@@ -1045,7 +1067,7 @@ pub fn main() !void {
     try writer.writeAll("-----------------------------------------------------------------------------------------------\n");
 
     for (bench_cases) |case| {
-        try runBenchCase(writer, alloc, case, &icu, itijah_reuse);
+        try runBenchCase(writer, alloc, case, &icu);
     }
 
     if (include_huge) {
@@ -1061,7 +1083,7 @@ pub fn main() !void {
                     .name = name,
                     .cps = cps,
                 };
-                try runBenchCase(writer, alloc, case, &icu, itijah_reuse);
+                try runBenchCase(writer, alloc, case, &icu);
             }
         }
     }

@@ -23,6 +23,7 @@ pub const shaping = @import("shaping/shaping.zig");
 pub const BidiLevel = level.BidiLevel;
 pub const ParDirection = types.ParDirection;
 pub const EmbeddingResult = types.EmbeddingResult;
+pub const EmbeddingScratchView = types.EmbeddingScratchView;
 pub const ReorderResult = types.ReorderResult;
 pub const ReorderResultScratchView = types.ReorderResultScratchView;
 pub const VisualRun = types.VisualRun;
@@ -78,6 +79,19 @@ pub fn getParEmbeddingLevelsScratch(
     return embedding.getParEmbeddingLevelsScratch(allocator, scratch, codepoints, par_dir);
 }
 
+/// Get paragraph embedding levels for a sequence of codepoints with reusable scratch buffers.
+///
+/// Returned levels are scratch-owned and remain valid until the next call that mutates
+/// the same scratch object.
+pub fn getParEmbeddingLevelsScratchView(
+    allocator: Allocator,
+    scratch: *EmbeddingScratch,
+    codepoints: []const u21,
+    par_dir: *ParDirection,
+) !EmbeddingScratchView {
+    return embedding.getParEmbeddingLevelsScratchView(allocator, scratch, codepoints, par_dir);
+}
+
 /// Reorder a line of codepoints from logical to visual order.
 /// Implements Rules L1.4, L2. Returns visual string and index maps.
 ///
@@ -116,13 +130,16 @@ pub fn reorderVisualOnly(
 }
 
 /// Reorder a line and return only visual codepoints with reusable scratch buffers.
+///
+/// Returned slice is scratch-owned and remains valid until the next call that mutates
+/// the same scratch object.
 pub fn reorderVisualOnlyScratch(
     allocator: Allocator,
     scratch: *ReorderScratch,
     codepoints: []const u21,
     levels: []const BidiLevel,
     base_level: BidiLevel,
-) ![]u21 {
+) ![]const u21 {
     return reorder.reorderVisualOnlyScratch(allocator, scratch, codepoints, levels, base_level);
 }
 
@@ -217,18 +234,13 @@ pub fn resolveVisualLayoutScratch(
     opts: LayoutOptions,
 ) !VisualLayoutScratchView {
     var dir = opts.base_dir;
-    var emb = try getParEmbeddingLevelsScratch(allocator, &scratch.embedding, codepoints, &dir);
-    defer emb.deinit();
-
-    try scratch.levels.ensureTotalCapacity(allocator, emb.levels.len);
-    scratch.levels.items.len = emb.levels.len;
-    @memcpy(scratch.levels.items, emb.levels);
+    const emb = try getParEmbeddingLevelsScratchView(allocator, &scratch.embedding, codepoints, &dir);
 
     const base_level = dir.toLevel();
     const l_to_v = try logToVisScratch(
         allocator,
         &scratch.log_to_vis,
-        scratch.levels.items,
+        emb.levels,
         base_level,
     );
     try scratch.v_to_l.ensureTotalCapacity(allocator, l_to_v.len);
@@ -238,10 +250,10 @@ pub fn resolveVisualLayoutScratch(
         v_to_l[visual_idx] = @intCast(logical_idx);
     }
 
-    const runs = try getVisualRunsScratch(allocator, &scratch.visual_runs, scratch.levels.items, base_level);
+    const runs = try getVisualRunsScratch(allocator, &scratch.visual_runs, emb.levels, base_level);
 
     return .{
-        .levels = scratch.levels.items,
+        .levels = emb.levels,
         .runs = runs,
         .l_to_v = l_to_v,
         .v_to_l = v_to_l,

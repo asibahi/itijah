@@ -46,6 +46,13 @@ pub const EmbeddingResult = struct {
     }
 };
 
+pub const EmbeddingScratchView = struct {
+    // Slice is owned by the scratch object passed to getParEmbeddingLevelsScratchView.
+    // It remains valid until the next mutation of that scratch.
+    levels: []const BidiLevel,
+    resolved_par_dir: ParDirection,
+};
+
 pub const ReorderResult = struct {
     visual: []u21,
     l_to_v: []u32,

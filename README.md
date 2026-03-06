@@ -236,11 +236,11 @@ brew install fribidi icu4c
 
 Detailed tables, environment, and methodology: [docs/benchmarks.md](docs/benchmarks.md).
 
-`bench-compare` measures `itijah` vs `fribidi` vs ICU across `analysis`, `reorder_line`, `resolve_visual_layout`, and scratch variants for LTR/RTL/MIXED corpora from 16 to 1M codepoints.
+`bench-compare` measures `itijah` vs `zabadi` (if present locally), `fribidi`, and ICU across `analysis` and `reorder_line` for LTR/RTL/MIXED corpora at `16`, `64`, `256`, `512`, `1024`, with optional huge sizes `262144`, `524288`, and `1048576`.
 
 ```sh
 zig build bench                                        # itijah-only report
-zig build bench-compare                                # itijah vs fribidi vs ICU
+zig build bench-compare                                # itijah vs zabadi vs fribidi vs ICU
 ITIJAH_COMPARE_INCLUDE_HUGE=1 zig build bench-compare  # include 262K-1M sizes
 ```
 

@@ -13,10 +13,12 @@ const visual_inplace_threshold: u32 = 2048;
 const compact_map_min_len: u32 = 8192;
 
 pub const ReorderScratch = struct {
+    visual: std.ArrayListUnmanaged(u21) = .{},
     map16: std.ArrayListUnmanaged(u16) = .{},
     map32: std.ArrayListUnmanaged(u32) = .{},
 
     pub fn deinit(self: *ReorderScratch, allocator: Allocator) void {
+        self.visual.deinit(allocator);
         self.map16.deinit(allocator);
         self.map32.deinit(allocator);
     }
@@ -210,18 +212,22 @@ pub fn reorderVisualOnly(
 }
 
 /// Reorder a line and return only the visual codepoints using reusable scratch memory.
+///
+/// Returned slice is owned by `scratch` and remains valid until the next call that
+/// mutates the same scratch object.
 pub fn reorderVisualOnlyScratch(
     allocator: Allocator,
     scratch: *ReorderScratch,
     codepoints: []const u21,
     levels: []const BidiLevel,
     base_level: BidiLevel,
-) ![]u21 {
+) ![]const u21 {
     const len: u32 = @intCast(codepoints.len);
     std.debug.assert(codepoints.len == levels.len);
 
-    const visual = try allocator.alloc(u21, len);
-    errdefer allocator.free(visual);
+    try scratch.visual.ensureTotalCapacity(allocator, len);
+    scratch.visual.items.len = len;
+    const visual = scratch.visual.items;
     if (len == 0) return visual;
 
     const extents = levelExtents(levels, base_level);
@@ -727,20 +733,24 @@ test "reorder visual only scratch reuse" {
     const testing = std.testing;
     const gpa = testing.allocator;
 
+    var counter = CountingAllocator.init(gpa);
+    const alloc = counter.allocator();
+
     var scratch = ReorderScratch{};
-    defer scratch.deinit(gpa);
+    defer scratch.deinit(alloc);
 
     const cps1 = [_]u21{ 'A', ' ', 0x05D0, 0x05D1 };
     const lv1 = [_]BidiLevel{ 0, 0, 1, 1 };
-    const vis1 = try reorderVisualOnlyScratch(gpa, &scratch, &cps1, &lv1, 0);
-    defer gpa.free(vis1);
+    const vis1 = try reorderVisualOnlyScratch(alloc, &scratch, &cps1, &lv1, 0);
     try testing.expectEqual(@as(u21, 0x05D1), vis1[2]);
     try testing.expectEqual(@as(u21, 0x05D0), vis1[3]);
 
+    const alloc_before_second = counter.alloc_count;
+
     const cps2 = [_]u21{ 'X', 'Y', 'Z' };
     const lv2 = [_]BidiLevel{ 0, 0, 0 };
-    const vis2 = try reorderVisualOnlyScratch(gpa, &scratch, &cps2, &lv2, 0);
-    defer gpa.free(vis2);
+    const vis2 = try reorderVisualOnlyScratch(alloc, &scratch, &cps2, &lv2, 0);
+    try testing.expectEqual(@as(usize, 0), counter.alloc_count - alloc_before_second);
     try testing.expectEqualSlices(u21, &cps2, vis2);
 }
 
