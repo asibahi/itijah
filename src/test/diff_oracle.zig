@@ -369,7 +369,7 @@ fn chooseLength(random: std.Random, max_len: usize) usize {
 
 fn runItijah(allocator: Allocator, cps: []const u21) !OracleResult {
     var layout = try itijah.resolveVisualLayout(allocator, cps, .{ .base_dir = .auto_ltr });
-    defer layout.deinit();
+    defer layout.deinit(allocator);
 
     const levels = try allocator.alloc(u8, layout.levels.len);
     errdefer allocator.free(levels);

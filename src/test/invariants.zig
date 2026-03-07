@@ -10,11 +10,11 @@ test "deterministic output" {
 
     var dir1: ParDirection = .auto_ltr;
     var r1 = try itijah.getParEmbeddingLevels(gpa, &input, &dir1);
-    defer r1.deinit();
+    defer r1.deinit(gpa);
 
     var dir2: ParDirection = .auto_ltr;
     var r2 = try itijah.getParEmbeddingLevels(gpa, &input, &dir2);
-    defer r2.deinit();
+    defer r2.deinit(gpa);
 
     try testing.expectEqualSlices(BidiLevel, r1.levels, r2.levels);
     try testing.expectEqual(r1.resolved_par_dir, r2.resolved_par_dir);
@@ -30,7 +30,7 @@ test "level bounds" {
 
     var dir: ParDirection = .ltr;
     var result = try itijah.getParEmbeddingLevels(gpa, &deep_input, &dir);
-    defer result.deinit();
+    defer result.deinit(gpa);
 
     for (result.levels) |l| {
         try testing.expect(l <= 126);
@@ -41,7 +41,7 @@ test "empty input" {
     const gpa = testing.allocator;
     var dir: ParDirection = .auto_ltr;
     var result = try itijah.getParEmbeddingLevels(gpa, &[_]u21{}, &dir);
-    defer result.deinit();
+    defer result.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), result.levels.len);
 }
 
@@ -52,7 +52,7 @@ test "single character" {
     {
         var dir: ParDirection = .auto_ltr;
         var result = try itijah.getParEmbeddingLevels(gpa, &[_]u21{'A'}, &dir);
-        defer result.deinit();
+        defer result.deinit(gpa);
         try testing.expectEqual(@as(BidiLevel, 0), result.levels[0]);
     }
 
@@ -60,7 +60,7 @@ test "single character" {
     {
         var dir: ParDirection = .auto_ltr;
         var result = try itijah.getParEmbeddingLevels(gpa, &[_]u21{0x05D0}, &dir);
-        defer result.deinit();
+        defer result.deinit(gpa);
         try testing.expectEqual(@as(BidiLevel, 1), result.levels[0]);
     }
 }
@@ -71,7 +71,7 @@ test "reorder round-trip: v_to_l and l_to_v are inverses" {
     const levels = [_]BidiLevel{ 0, 0, 1, 1, 0 };
 
     var result = try itijah.reorderLine(gpa, &input, &levels, 0);
-    defer result.deinit();
+    defer result.deinit(gpa);
 
     // v_to_l[l_to_v[i]] == i for all i
     for (0..input.len) |i| {
@@ -87,7 +87,7 @@ test "memory leak: repeated alloc/dealloc" {
         var dir: ParDirection = .auto_ltr;
         const input = [_]u21{ 'A', 0x05D0, 'B', 0x05D1, ' ', '!', 0x0627 };
         var result = try itijah.getParEmbeddingLevels(gpa, &input, &dir);
-        result.deinit();
+        result.deinit(gpa);
     }
 }
 
@@ -96,7 +96,7 @@ test "forced LTR direction ignores strong RTL" {
     var dir: ParDirection = .ltr;
     const input = [_]u21{ 0x05D0, 0x05D1, 0x05D2 };
     var result = try itijah.getParEmbeddingLevels(gpa, &input, &dir);
-    defer result.deinit();
+    defer result.deinit(gpa);
 
     try testing.expectEqual(ParDirection.ltr, result.resolved_par_dir);
     // RTL chars in LTR paragraph get level 1
@@ -110,7 +110,7 @@ test "forced RTL direction ignores strong LTR" {
     var dir: ParDirection = .rtl;
     const input = [_]u21{ 'A', 'B', 'C' };
     var result = try itijah.getParEmbeddingLevels(gpa, &input, &dir);
-    defer result.deinit();
+    defer result.deinit(gpa);
 
     try testing.expectEqual(ParDirection.rtl, result.resolved_par_dir);
     // LTR chars in RTL paragraph get level 2
@@ -125,7 +125,7 @@ test "numbers in RTL context" {
     // Hebrew + digits
     const input = [_]u21{ 0x05D0, '1', '2', '3', 0x05D1 };
     var result = try itijah.getParEmbeddingLevels(gpa, &input, &dir);
-    defer result.deinit();
+    defer result.deinit(gpa);
 
     try testing.expectEqual(@as(BidiLevel, 1), result.levels[0]); // R
     try testing.expectEqual(@as(BidiLevel, 2), result.levels[1]); // EN -> level 2 in RTL

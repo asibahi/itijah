@@ -207,7 +207,7 @@ fn runCase(
 ) !bool {
     var dir = direction;
     var emb = try itijah.getParEmbeddingLevels(allocator, codepoints, &dir);
-    defer emb.deinit();
+    defer emb.deinit(allocator);
 
     if (emb.levels.len != expected_levels.len) return false;
     for (emb.levels, expected_levels) |actual, expected| {
@@ -217,7 +217,7 @@ fn runCase(
 
     const base_level = dir.toLevel();
     var vis = try itijah.reorderLine(allocator, codepoints, emb.levels, base_level);
-    defer vis.deinit();
+    defer vis.deinit(allocator);
 
     if (vis.v_to_l.len != expected_levels.len) return false;
     for (0..vis.v_to_l.len) |logical_idx| {

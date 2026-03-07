@@ -186,7 +186,6 @@ pub fn getParEmbeddingLevels(
         return .{
             .levels = levels,
             .resolved_par_dir = if (par_dir.isAuto()) .ltr else par_dir.*,
-            .allocator = allocator,
         };
     }
 
@@ -214,7 +213,6 @@ pub fn getParEmbeddingLevels(
             return .{
                 .levels = levels,
                 .resolved_par_dir = .ltr,
-                .allocator = allocator,
             };
         }
     }
@@ -227,7 +225,6 @@ pub fn getParEmbeddingLevels(
         return .{
             .levels = levels,
             .resolved_par_dir = .ltr,
-            .allocator = allocator,
         };
     }
 
@@ -240,7 +237,6 @@ pub fn getParEmbeddingLevels(
         return .{
             .levels = levels,
             .resolved_par_dir = .ltr,
-            .allocator = allocator,
         };
     }
 
@@ -303,7 +299,6 @@ pub fn getParEmbeddingLevels(
     return .{
         .levels = levels,
         .resolved_par_dir = resolved_dir,
-        .allocator = allocator,
     };
 }
 
@@ -445,22 +440,6 @@ pub fn getParEmbeddingLevelsScratchView(
     return .{
         .levels = scratch.levels.items,
         .resolved_par_dir = resolved_dir,
-    };
-}
-
-/// Resolve paragraph embedding levels using reusable scratch buffers.
-pub fn getParEmbeddingLevelsScratch(
-    allocator: Allocator,
-    scratch: *EmbeddingScratch,
-    codepoints: []const u21,
-    par_dir: *ParDirection,
-) !types.EmbeddingResult {
-    const view = try getParEmbeddingLevelsScratchView(allocator, scratch, codepoints, par_dir);
-    const levels = try allocator.dupe(BidiLevel, view.levels);
-    return .{
-        .levels = levels,
-        .resolved_par_dir = view.resolved_par_dir,
-        .allocator = allocator,
     };
 }
 
@@ -1894,7 +1873,7 @@ fn getParEmbeddingLevelsAllocProbe(allocator: Allocator) !void {
     const input = [_]u21{ 'a', 0x2067, '(', 0x05D0, ')', 0x2069, ' ', '[', '1', ']', 'b' };
     var dir: ParDirection = .auto_ltr;
     var result = try getParEmbeddingLevels(allocator, &input, &dir);
-    defer result.deinit();
+    defer result.deinit(allocator);
 }
 
 fn computeIsolatingRunSequencesPopProbe(allocator: Allocator) !void {
@@ -1981,7 +1960,7 @@ test "regression: explicit overflow counters handle long explicit runs" {
 
     var dir: ParDirection = .ltr;
     var result = try getParEmbeddingLevels(gpa, &input, &dir);
-    defer result.deinit();
+    defer result.deinit(gpa);
 
     try testing.expectEqual(@as(BidiLevel, 0), result.levels[input.len - 1]);
 }
@@ -2001,7 +1980,7 @@ test "regression: BD16 overflow keeps expected conformance behavior" {
 
     var dir: ParDirection = .rtl;
     var emb = try getParEmbeddingLevels(gpa, &cps, &dir);
-    defer emb.deinit();
+    defer emb.deinit(gpa);
 
     for (0..(1 + opens + 1)) |i| {
         try testing.expectEqual(@as(BidiLevel, 2), emb.levels[i]);
@@ -2011,7 +1990,7 @@ test "regression: BD16 overflow keeps expected conformance behavior" {
     }
 
     var vis = try reorder.reorderLine(gpa, &cps, emb.levels, dir.toLevel());
-    defer vis.deinit();
+    defer vis.deinit(gpa);
 
     for (0..closes) |i| {
         try testing.expectEqual(@as(u32, @intCast(cps.len - 1 - i)), vis.v_to_l[i]);
@@ -2091,7 +2070,7 @@ test "P2-P3: paragraph direction detection" {
     {
         var dir: ParDirection = .auto_ltr;
         var result = try getParEmbeddingLevels(gpa, &[_]u21{ 'H', 'e', 'l', 'l', 'o' }, &dir);
-        defer result.deinit();
+        defer result.deinit(gpa);
         try testing.expectEqual(ParDirection.ltr, result.resolved_par_dir);
         for (result.levels) |l| try testing.expectEqual(@as(BidiLevel, 0), l);
     }
@@ -2100,7 +2079,7 @@ test "P2-P3: paragraph direction detection" {
     {
         var dir: ParDirection = .auto_ltr;
         var result = try getParEmbeddingLevels(gpa, &[_]u21{ 0x05D0, 0x05D1, 0x05D2 }, &dir);
-        defer result.deinit();
+        defer result.deinit(gpa);
         try testing.expectEqual(ParDirection.rtl, result.resolved_par_dir);
         for (result.levels) |l| try testing.expectEqual(@as(BidiLevel, 1), l);
     }
@@ -2109,7 +2088,7 @@ test "P2-P3: paragraph direction detection" {
     {
         var dir: ParDirection = .auto_ltr;
         var result = try getParEmbeddingLevels(gpa, &[_]u21{}, &dir);
-        defer result.deinit();
+        defer result.deinit(gpa);
         try testing.expectEqual(@as(usize, 0), result.levels.len);
     }
 }
@@ -2123,7 +2102,7 @@ test "explicit levels: LRE/RLE" {
         var dir: ParDirection = .ltr;
         const input = [_]u21{ 0x202B, 0x05D0, 0x05D1, 0x202C }; // RLE, Alef, Bet, PDF
         var result = try getParEmbeddingLevels(gpa, &input, &dir);
-        defer result.deinit();
+        defer result.deinit(gpa);
         try testing.expectEqual(@as(BidiLevel, 1), result.levels[1]); // Alef at level 1
         try testing.expectEqual(@as(BidiLevel, 1), result.levels[2]); // Bet at level 1
     }
@@ -2141,7 +2120,7 @@ test "conformance regression: explicit controls do not perturb ordering (sample 
 
     var dir: ParDirection = .rtl;
     var emb = try getParEmbeddingLevels(gpa, &cps, &dir);
-    defer emb.deinit();
+    defer emb.deinit(gpa);
 
     var actual_levels = std.ArrayListUnmanaged(BidiLevel){};
     defer actual_levels.deinit(gpa);
@@ -2153,7 +2132,7 @@ test "conformance regression: explicit controls do not perturb ordering (sample 
     try testing.expectEqualSlices(BidiLevel, &expected_levels_non_ignored, actual_levels.items);
 
     var vis = try reorder.reorderLine(gpa, &cps, emb.levels, dir.toLevel());
-    defer vis.deinit();
+    defer vis.deinit(gpa);
 
     var actual = std.ArrayListUnmanaged(u32){};
     defer actual.deinit(gpa);
@@ -2177,7 +2156,7 @@ test "conformance regression: explicit controls with brackets in RTL (sample 6)"
 
     var dir: ParDirection = .rtl;
     var emb = try getParEmbeddingLevels(gpa, &cps, &dir);
-    defer emb.deinit();
+    defer emb.deinit(gpa);
 
     var actual_levels = std.ArrayListUnmanaged(BidiLevel){};
     defer actual_levels.deinit(gpa);
@@ -2189,7 +2168,7 @@ test "conformance regression: explicit controls with brackets in RTL (sample 6)"
     try testing.expectEqualSlices(BidiLevel, &expected_levels_non_ignored, actual_levels.items);
 
     var vis = try reorder.reorderLine(gpa, &cps, emb.levels, dir.toLevel());
-    defer vis.deinit();
+    defer vis.deinit(gpa);
 
     var actual = std.ArrayListUnmanaged(u32){};
     defer actual.deinit(gpa);
@@ -2214,7 +2193,7 @@ test "conformance regression: R ON RLE B in ltr keeps ON at level 0" {
 
     var dir: ParDirection = .ltr;
     var emb = try getParEmbeddingLevels(gpa, &cps, &dir);
-    defer emb.deinit();
+    defer emb.deinit(gpa);
 
     var actual_levels = std.ArrayListUnmanaged(BidiLevel){};
     defer actual_levels.deinit(gpa);
@@ -2226,7 +2205,7 @@ test "conformance regression: R ON RLE B in ltr keeps ON at level 0" {
     try testing.expectEqualSlices(BidiLevel, &expected_levels_non_ignored, actual_levels.items);
 
     var vis = try reorder.reorderLine(gpa, &cps, emb.levels, dir.toLevel());
-    defer vis.deinit();
+    defer vis.deinit(gpa);
 
     var actual = std.ArrayListUnmanaged(u32){};
     defer actual.deinit(gpa);
@@ -2249,12 +2228,12 @@ test "conformance regression: EN ES ES EN in rtl" {
 
     var dir: ParDirection = .rtl;
     var emb = try getParEmbeddingLevels(gpa, &cps, &dir);
-    defer emb.deinit();
+    defer emb.deinit(gpa);
 
     try testing.expectEqualSlices(BidiLevel, &expected_levels, emb.levels);
 
     var vis = try reorder.reorderLine(gpa, &cps, emb.levels, dir.toLevel());
-    defer vis.deinit();
+    defer vis.deinit(gpa);
     try testing.expectEqualSlices(u32, &expected_order, vis.v_to_l);
 }
 
@@ -2270,7 +2249,7 @@ test "conformance regression: BidiCharacter sample 1" {
 
     var dir: ParDirection = .ltr;
     var emb = try getParEmbeddingLevels(gpa, &cps, &dir);
-    defer emb.deinit();
+    defer emb.deinit(gpa);
 
     var actual_levels = std.ArrayListUnmanaged(BidiLevel){};
     defer actual_levels.deinit(gpa);
@@ -2282,7 +2261,7 @@ test "conformance regression: BidiCharacter sample 1" {
     try testing.expectEqualSlices(BidiLevel, &expected_levels_non_ignored, actual_levels.items);
 
     var vis = try reorder.reorderLine(gpa, &cps, emb.levels, dir.toLevel());
-    defer vis.deinit();
+    defer vis.deinit(gpa);
     var actual_order = std.ArrayListUnmanaged(u32){};
     defer actual_order.deinit(gpa);
     for (vis.v_to_l) |logical_idx| {
@@ -2305,7 +2284,7 @@ test "conformance regression: BidiCharacter sample 4" {
 
     var dir: ParDirection = .rtl;
     var emb = try getParEmbeddingLevels(gpa, &cps, &dir);
-    defer emb.deinit();
+    defer emb.deinit(gpa);
 
     var actual_levels = std.ArrayListUnmanaged(BidiLevel){};
     defer actual_levels.deinit(gpa);
@@ -2317,7 +2296,7 @@ test "conformance regression: BidiCharacter sample 4" {
     try testing.expectEqualSlices(BidiLevel, &expected_levels_non_ignored, actual_levels.items);
 
     var vis = try reorder.reorderLine(gpa, &cps, emb.levels, dir.toLevel());
-    defer vis.deinit();
+    defer vis.deinit(gpa);
     var actual_order = std.ArrayListUnmanaged(u32){};
     defer actual_order.deinit(gpa);
     for (vis.v_to_l) |logical_idx| {
@@ -2328,7 +2307,7 @@ test "conformance regression: BidiCharacter sample 4" {
     try testing.expectEqualSlices(u32, &expected_order, actual_order.items);
 }
 
-test "scratch API matches default API" {
+test "scratch view matches default API" {
     const testing = std.testing;
     const gpa = testing.allocator;
 
@@ -2339,14 +2318,13 @@ test "scratch API matches default API" {
 
     var dir_default: ParDirection = .auto_ltr;
     var result_default = try getParEmbeddingLevels(gpa, &input, &dir_default);
-    defer result_default.deinit();
+    defer result_default.deinit(gpa);
 
-    var dir_scratch: ParDirection = .auto_ltr;
-    var result_scratch = try getParEmbeddingLevelsScratch(gpa, &scratch, &input, &dir_scratch);
-    defer result_scratch.deinit();
+    var dir_view: ParDirection = .auto_ltr;
+    const view = try getParEmbeddingLevelsScratchView(gpa, &scratch, &input, &dir_view);
 
-    try testing.expectEqual(dir_default, dir_scratch);
-    try testing.expectEqualSlices(BidiLevel, result_default.levels, result_scratch.levels);
+    try testing.expectEqual(dir_default, dir_view);
+    try testing.expectEqualSlices(BidiLevel, result_default.levels, view.levels);
 }
 
 test "scratch view API matches default API and reuses capacity" {
@@ -2361,7 +2339,7 @@ test "scratch view API matches default API and reuses capacity" {
     };
     var dir_default: ParDirection = .auto_ltr;
     var result_default = try getParEmbeddingLevels(gpa, &input_big, &dir_default);
-    defer result_default.deinit();
+    defer result_default.deinit(gpa);
 
     var dir_view: ParDirection = .auto_ltr;
     const view_big = try getParEmbeddingLevelsScratchView(gpa, &scratch, &input_big, &dir_view);
@@ -2380,6 +2358,6 @@ test "memory leak check" {
     // Mixed LTR/RTL
     const input = [_]u21{ 'A', 'B', 0x05D0, 0x05D1, 'C', 'D' };
     var result = try getParEmbeddingLevels(gpa, &input, &dir);
-    result.deinit();
+    result.deinit(gpa);
     // If GPA doesn't report leaks, we're good
 }

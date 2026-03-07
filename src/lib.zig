@@ -70,16 +70,6 @@ pub fn getParEmbeddingLevels(
 }
 
 /// Get paragraph embedding levels for a sequence of codepoints with reusable scratch buffers.
-pub fn getParEmbeddingLevelsScratch(
-    allocator: Allocator,
-    scratch: *EmbeddingScratch,
-    codepoints: []const u21,
-    par_dir: *ParDirection,
-) !EmbeddingResult {
-    return embedding.getParEmbeddingLevelsScratch(allocator, scratch, codepoints, par_dir);
-}
-
-/// Get paragraph embedding levels for a sequence of codepoints with reusable scratch buffers.
 ///
 /// Returned levels are scratch-owned and remain valid until the next call that mutates
 /// the same scratch object.
@@ -198,7 +188,7 @@ pub fn resolveVisualLayout(
 ) !VisualLayout {
     var dir = opts.base_dir;
     var emb = try getParEmbeddingLevels(allocator, codepoints, &dir);
-    errdefer emb.deinit();
+    errdefer emb.deinit(allocator);
 
     const base_level = dir.toLevel();
     const l_to_v = try logToVis(allocator, emb.levels, base_level);
@@ -219,7 +209,6 @@ pub fn resolveVisualLayout(
         .l_to_v = l_to_v,
         .v_to_l = v_to_l,
         .base_level = base_level,
-        .allocator = allocator,
     };
 }
 
@@ -336,12 +325,12 @@ test "end-to-end: pure LTR" {
     const input = [_]u21{ 'H', 'e', 'l', 'l', 'o' };
 
     var emb = try getParEmbeddingLevels(gpa, &input, &dir);
-    defer emb.deinit();
+    defer emb.deinit(gpa);
 
     try std.testing.expectEqual(ParDirection.ltr, emb.resolved_par_dir);
 
     var vis = try reorderLine(gpa, &input, emb.levels, 0);
-    defer vis.deinit();
+    defer vis.deinit(gpa);
 
     try std.testing.expectEqualSlices(u21, &input, vis.visual);
 }
@@ -352,12 +341,12 @@ test "end-to-end: pure RTL" {
     const input = [_]u21{ 0x05D0, 0x05D1, 0x05D2 };
 
     var emb = try getParEmbeddingLevels(gpa, &input, &dir);
-    defer emb.deinit();
+    defer emb.deinit(gpa);
 
     try std.testing.expectEqual(ParDirection.rtl, emb.resolved_par_dir);
 
     var vis = try reorderLine(gpa, &input, emb.levels, 1);
-    defer vis.deinit();
+    defer vis.deinit(gpa);
 
     try std.testing.expectEqual(@as(u21, 0x05D2), vis.visual[0]);
     try std.testing.expectEqual(@as(u21, 0x05D0), vis.visual[2]);
@@ -370,7 +359,7 @@ test "end-to-end: mixed LTR + RTL" {
     const input = [_]u21{ 'A', 'B', ' ', 0x05D0, 0x05D1, ' ', 'C', 'D' };
 
     var emb = try getParEmbeddingLevels(gpa, &input, &dir);
-    defer emb.deinit();
+    defer emb.deinit(gpa);
 
     try std.testing.expectEqual(ParDirection.ltr, emb.resolved_par_dir);
     try std.testing.expectEqual(@as(BidiLevel, 0), emb.levels[0]); // A
@@ -379,7 +368,7 @@ test "end-to-end: mixed LTR + RTL" {
     try std.testing.expectEqual(@as(BidiLevel, 0), emb.levels[6]); // C
 
     var vis = try reorderLine(gpa, &input, emb.levels, 0);
-    defer vis.deinit();
+    defer vis.deinit(gpa);
 
     // "AB " stays, "אב" reverses to "בא", " CD" stays
     try std.testing.expectEqual(@as(u21, 'A'), vis.visual[0]);
@@ -400,12 +389,12 @@ test "end-to-end: LTR with trailing digits after RTL word" {
     };
 
     var emb = try getParEmbeddingLevels(gpa, &input, &dir);
-    defer emb.deinit();
+    defer emb.deinit(gpa);
 
     try std.testing.expectEqual(ParDirection.ltr, emb.resolved_par_dir);
 
     var vis = try reorderLine(gpa, &input, emb.levels, dir.toLevel());
-    defer vis.deinit();
+    defer vis.deinit(gpa);
 
     // Visual order should place digits to the left of the RTL word in an LTR paragraph.
     // Expected: "hello, 123 ابحرم"
@@ -424,12 +413,12 @@ test "end-to-end: RTL letter space digits reorder visually" {
     const input = [_]u21{ 0x0645, ' ', '5', '3' };
 
     var emb = try getParEmbeddingLevels(gpa, &input, &dir);
-    defer emb.deinit();
+    defer emb.deinit(gpa);
 
     try std.testing.expectEqual(ParDirection.rtl, emb.resolved_par_dir);
 
     var vis = try reorderLine(gpa, &input, emb.levels, dir.toLevel());
-    defer vis.deinit();
+    defer vis.deinit(gpa);
 
     const expected = [_]u21{ '5', '3', ' ', 0x0645 };
     try std.testing.expectEqualSlices(u21, &expected, vis.visual);
@@ -442,12 +431,12 @@ test "end-to-end: RTL letters around digits keep number run order" {
     const input = [_]u21{ 0x0645, ' ', '5', '3', ' ', 0x0645 };
 
     var emb = try getParEmbeddingLevels(gpa, &input, &dir);
-    defer emb.deinit();
+    defer emb.deinit(gpa);
 
     try std.testing.expectEqual(ParDirection.rtl, emb.resolved_par_dir);
 
     var vis = try reorderLine(gpa, &input, emb.levels, dir.toLevel());
-    defer vis.deinit();
+    defer vis.deinit(gpa);
 
     const expected = [_]u21{ 0x0645, ' ', '5', '3', ' ', 0x0645 };
     try std.testing.expectEqualSlices(u21, &expected, vis.visual);

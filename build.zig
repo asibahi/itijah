@@ -131,6 +131,23 @@ pub fn build(b: *std.Build) void {
         } else |_| {}
     } else |_| {}
 
+    if (std.fs.cwd().access("examples/basic.zig", .{})) |_| {
+        const example_mod = b.createModule(.{
+            .root_source_file = b.path("examples/basic.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        });
+        example_mod.addImport("itijah", internal_mod);
+
+        const example_exe = b.addExecutable(.{
+            .name = "itijah-example",
+            .root_module = example_mod,
+        });
+        const run_example = b.addRunArtifact(example_exe);
+        const example_step = b.step("example", "Run basic usage example");
+        example_step.dependOn(&run_example.step);
+    } else |_| {}
+
     const docs_obj = b.addObject(.{
         .name = "itijah-docs",
         .root_module = internal_mod,

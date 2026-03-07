@@ -4,6 +4,16 @@ Zig-native implementation of the Unicode Bidirectional Algorithm ([UAX #9](https
 
 Codepoint-based API inspired by FriBidi's design, implemented idiomatically in Zig with no global state and explicit allocator passing. Competitive with FriBidi and ICU; faster on LTR and mixed-direction text, with scratch APIs for allocation-light high-throughput loops.
 
+## Contents
+
+- [Status](#status) — implemented rules and roadmap
+- [API](#api) — quick reference with code examples
+- [Usage Guide](docs/usage.md) — choosing between owned and scratch APIs, memory ownership, terminal integration
+- [Benchmarks](docs/benchmarks.md) — performance comparison vs zabadi, fribidi, ICU
+- [Compatibility](docs/compatibility.md) — conformance results and differential testing
+- [Building](#building) — build commands and dependencies
+- [Examples](examples/basic.zig) — runnable example
+
 ## Status
 
 ### Implemented
@@ -54,11 +64,11 @@ const itijah = @import("itijah");
 // Get embedding levels
 var dir: itijah.ParDirection = .auto_ltr;
 var emb = try itijah.getParEmbeddingLevels(allocator, codepoints, &dir);
-defer emb.deinit();
+defer emb.deinit(allocator);
 
 // Reorder to visual order
 var vis = try itijah.reorderLine(allocator, codepoints, emb.levels, dir.toLevel());
-defer vis.deinit();
+defer vis.deinit(allocator);
 
 // Logical-to-visual index map
 const l2v = try itijah.logToVis(allocator, emb.levels, dir.toLevel());
@@ -72,7 +82,7 @@ defer allocator.free(runs);
 var layout = try itijah.resolveVisualLayout(allocator, codepoints, .{
     .base_dir = .ltr,
 });
-defer layout.deinit();
+defer layout.deinit(allocator);
 
 // Remove bidi control marks
 const cleaned = try itijah.removeBidiMarks(allocator, codepoints, null);
@@ -88,8 +98,8 @@ var re_scratch = itijah.ReorderScratch{};
 defer re_scratch.deinit(allocator);
 
 var dir: itijah.ParDirection = .auto_ltr;
-var emb = try itijah.getParEmbeddingLevelsScratch(allocator, &emb_scratch, codepoints, &dir);
-defer emb.deinit();
+const emb = try itijah.getParEmbeddingLevelsScratchView(allocator, &emb_scratch, codepoints, &dir);
+// emb.levels is scratch-owned, valid until next emb_scratch mutation
 
 const visual = try itijah.reorderVisualOnlyScratch(
     allocator,
@@ -98,7 +108,7 @@ const visual = try itijah.reorderVisualOnlyScratch(
     emb.levels,
     dir.toLevel(),
 );
-defer allocator.free(visual);
+// visual is scratch-owned, valid until next re_scratch mutation
 
 var line_scratch = itijah.ReorderLineScratch{};
 defer line_scratch.deinit(allocator);
@@ -142,6 +152,8 @@ const layout_view = try itijah.resolveVisualLayoutScratch(
 _ = layout_view; // scratch-owned slices
 ```
 
+For a detailed guide on choosing between owned and scratch APIs, memory ownership, and integration patterns, see [docs/usage.md](docs/usage.md).
+
 ## Terminal Integration
 
 Minimal row pipeline (left-anchored terminal row, line-scoped bidi):
@@ -150,7 +162,7 @@ Minimal row pipeline (left-anchored terminal row, line-scoped bidi):
 const layout = try itijah.resolveVisualLayout(allocator, row_codepoints, .{
     .base_dir = .ltr, // terminal row base direction
 });
-defer layout.deinit();
+defer layout.deinit(allocator);
 
 for (layout.runs) |run| {
     // Feed shaper in logical order for this run's contiguous logical slice.

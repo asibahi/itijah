@@ -83,7 +83,6 @@ pub fn reorderLine(
             .l_to_v = l_to_v,
             .v_to_l = v_to_l,
             .max_level = base_level,
-            .allocator = allocator,
         };
     }
 
@@ -114,7 +113,6 @@ pub fn reorderLine(
         .l_to_v = l_to_v,
         .v_to_l = map,
         .max_level = extents.max_level,
-        .allocator = allocator,
     };
 }
 
@@ -523,7 +521,7 @@ fn reorderLineEmptyAllocProbe(allocator: Allocator) !void {
     const cps = [_]u21{};
     const levels = [_]BidiLevel{};
     var result = try reorderLine(allocator, &cps, &levels, 0);
-    defer result.deinit();
+    defer result.deinit(allocator);
 }
 
 const CountingAllocator = struct {
@@ -596,7 +594,7 @@ test "reorderLineScratch matches owned API and reuses capacity" {
         0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 0, 0, 0, 1, 1, 0, 0, 0,
     };
     var expected_big = try reorderLine(gpa, &cps_big, &lv_big, 0);
-    defer expected_big.deinit();
+    defer expected_big.deinit(gpa);
     const got_big = try reorderLineScratch(alloc, &scratch, &cps_big, &lv_big, 0);
     try testing.expectEqualSlices(u21, expected_big.visual, got_big.visual);
     try testing.expectEqualSlices(u32, expected_big.l_to_v, got_big.l_to_v);
@@ -608,7 +606,7 @@ test "reorderLineScratch matches owned API and reuses capacity" {
     const cps_small = [_]u21{ 'A', ' ', 0x05D0, 0x05D1, ' ', 'B' };
     const lv_small = [_]BidiLevel{ 0, 0, 1, 1, 0, 0 };
     var expected_small = try reorderLine(gpa, &cps_small, &lv_small, 0);
-    defer expected_small.deinit();
+    defer expected_small.deinit(gpa);
     const got_small = try reorderLineScratch(alloc, &scratch, &cps_small, &lv_small, 0);
 
     try testing.expectEqual(@as(usize, 0), counter.alloc_count - alloc_before_second);
@@ -678,7 +676,7 @@ test "reorder pure LTR" {
     const cps = [_]u21{ 'H', 'e', 'l', 'l', 'o' };
     const levels = [_]BidiLevel{ 0, 0, 0, 0, 0 };
     var result = try reorderLine(gpa, &cps, &levels, 0);
-    defer result.deinit();
+    defer result.deinit(gpa);
 
     try testing.expectEqualSlices(u21, &cps, result.visual);
 }
@@ -690,7 +688,7 @@ test "reorder pure RTL" {
     const cps = [_]u21{ 0x05D0, 0x05D1, 0x05D2 };
     const levels = [_]BidiLevel{ 1, 1, 1 };
     var result = try reorderLine(gpa, &cps, &levels, 1);
-    defer result.deinit();
+    defer result.deinit(gpa);
 
     // RTL should reverse
     try testing.expectEqual(@as(u21, 0x05D2), result.visual[0]);
@@ -706,7 +704,7 @@ test "reorder mixed LTR-RTL" {
     const cps = [_]u21{ 'H', 'e', 'l', 'l', 'o', ' ', 0x05D0, 0x05D1, 0x05D2 };
     const levels = [_]BidiLevel{ 0, 0, 0, 0, 0, 0, 1, 1, 1 };
     var result = try reorderLine(gpa, &cps, &levels, 0);
-    defer result.deinit();
+    defer result.deinit(gpa);
 
     // LTR part stays, RTL part reverses
     try testing.expectEqual(@as(u21, 'H'), result.visual[0]);
@@ -804,7 +802,7 @@ test "visual runs reconstruct reorder v_to_l map" {
     const levels = [_]BidiLevel{ 0, 0, 1, 1, 2, 2, 0, 1 };
 
     var reordered = try reorderLine(gpa, &cps, &levels, 0);
-    defer reordered.deinit();
+    defer reordered.deinit(gpa);
 
     const runs = try visualRuns(gpa, &levels, 0);
     defer gpa.free(runs);

@@ -53,7 +53,7 @@ fn runLayoutCase(cps: []const u21, opts: itijah.LayoutOptions) !void {
     const gpa = testing.allocator;
 
     var owned = try itijah.resolveVisualLayout(gpa, cps, opts);
-    defer owned.deinit();
+    defer owned.deinit(gpa);
     try assertLayoutInvariants(owned.levels, owned.runs, owned.l_to_v, owned.v_to_l);
 
     var scratch = itijah.VisualLayoutScratch{};
